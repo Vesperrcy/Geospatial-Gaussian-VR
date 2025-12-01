@@ -11,7 +11,7 @@ INPUT_PATH = Path("data/navvis_house2_centered.ply")
 OUTPUT_PATH = Path("data/navvis_house2_gaussians_demo.npz")
 
 # 用于 Unity demo 的最大高斯数量
-MAX_GAUSSIANS = 50000
+MAX_GAUSSIANS = 200000
 
 # 用于估计局部尺度的邻域大小
 K_NEIGHBORS = 8

@@ -34,19 +34,30 @@ Shader "Unlit/GaussianPoints"
                 float  psize : PSIZE;
             };
 
-            v2f vert(appdata v)
+            v2f vert (appdata v)
             {
                 v2f o;
 
                 float3 localPos = _Positions[v.vertexID];
                 float4 worldPos4 = mul(_LocalToWorld, float4(localPos, 1.0));
 
-                o.pos = UnityObjectToClipPos(worldPos4);
+                float4 clipPos = UnityObjectToClipPos(worldPos4);
+                o.pos = clipPos;
 
                 float3 c = _Colors[v.vertexID];
-                o.col = float4(c, 1);
+                o.col = float4(c, 1.0);
 
-                o.psize = _PointSize * 10.0;
+                // ===== 这里开始改：用世界空间距离 =====
+                float3 worldPos = worldPos4.xyz;
+                float dist = distance(_WorldSpaceCameraPos.xyz, worldPos);
+                dist = max(dist, 0.01);         // 防止除以 0
+
+                float k = 50.0;
+                float size = _PointSize * k / dist;
+
+                size = clamp(size, 1.0, 40.0);
+                o.psize = size;
+                // =====================================
 
                 return o;
             }

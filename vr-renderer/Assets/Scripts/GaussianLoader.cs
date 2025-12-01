@@ -72,6 +72,12 @@ public class GaussianLoader : MonoBehaviour
         pointMaterial.SetFloat("_PointSize", pointSize);
     }
 
+    //void OnDrawGizmos()
+    //{
+    //    Gizmos.color = Color.yellow;
+    //    Gizmos.DrawWireCube(transform.position, new Vector3(200, 200, 200));
+    //}
+
     void OnRenderObject()
     {
         if (_positionBuffer == null) return;

@@ -463,7 +463,7 @@ MonoBehaviour:
   m_EditorClassIdentifier: Assembly-CSharp::GaussianLoader
   dataFileName: navvis_house2_gaussians_demo.txt
   pointMaterial: {fileID: 2100000, guid: 4d676345d90bb4428b4d58585f78ae1a, type: 2}
-  pointSize: 0.5
+  pointSize: 0.1
 --- !u!4 &847526911
 Transform:
   m_ObjectHideFlags: 0
