@@ -5,10 +5,10 @@ from pathlib import Path
 # ==== 配置 ====
 
 # CloudCompare 导出的、已经居中/清洗过的点云
-INPUT_PATH = Path("data/navvis_house2_centered.ply")
+INPUT_PATH = Path("data/SampleBlock1.ply")
 
 # 输出的 Gaussian 参数（给以后研究用）
-OUTPUT_PATH = Path("data/navvis_house2_gaussians_demo.npz")
+OUTPUT_PATH = Path("data/SampleBlock1_gaussians_demo.npz")
 
 # 用于 demo 的最大高斯数量（开发阶段可以改小一点，比如 20000，加速调试）
 MAX_GAUSSIANS = 20000

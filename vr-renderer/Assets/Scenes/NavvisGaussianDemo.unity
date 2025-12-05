@@ -383,6 +383,54 @@ MonoBehaviour:
   m_ShadowLayerMask: 1
   m_RenderingLayers: 1
   m_ShadowRenderingLayers: 1
+--- !u!1 &429486325
+GameObject:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  serializedVersion: 6
+  m_Component:
+  - component: {fileID: 429486327}
+  - component: {fileID: 429486328}
+  m_Layer: 0
+  m_Name: NavvisChunkManager
+  m_TagString: Untagged
+  m_Icon: {fileID: 0}
+  m_NavMeshLayer: 0
+  m_StaticEditorFlags: 0
+  m_IsActive: 0
+--- !u!4 &429486327
+Transform:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 429486325}
+  serializedVersion: 2
+  m_LocalRotation: {x: -0.7071068, y: 0, z: 0, w: 0.7071068}
+  m_LocalPosition: {x: 0, y: 0, z: 0}
+  m_LocalScale: {x: 1, y: 1, z: 1}
+  m_ConstrainProportionsScale: 0
+  m_Children: []
+  m_Father: {fileID: 0}
+  m_LocalEulerAnglesHint: {x: -90, y: 0, z: 0}
+--- !u!114 &429486328
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 429486325}
+  m_Enabled: 0
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: e6b7c26929bad42f1926cde4a17b6135, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: Assembly-CSharp::GaussianChunkManager
+  lodIndexFileName: navvis_chunks/navvis_chunks_lod_index.json
+  pointMaterial: {fileID: 2100000, guid: 4d676345d90bb4428b4d58585f78ae1a, type: 2}
+  pointSize: 1
+  loadOnStart: 1
 --- !u!1 &832575517
 GameObject:
   m_ObjectHideFlags: 0
@@ -461,9 +509,11 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: 464e52e080ede4429b1f84257e2067e9, type: 3}
   m_Name: 
   m_EditorClassIdentifier: Assembly-CSharp::GaussianLoader
-  dataFileName: navvis_house2_gaussians_demo.txt
+  dataFileName: 
   pointMaterial: {fileID: 2100000, guid: 4d676345d90bb4428b4d58585f78ae1a, type: 2}
-  pointSize: 0.1
+  pointSize: 2
+  treatInputAsWorldSpace: 0
+  chunkCenterWorld: {x: 0, y: 0, z: 0}
 --- !u!4 &847526911
 Transform:
   m_ObjectHideFlags: 0
@@ -487,3 +537,4 @@ SceneRoots:
   - {fileID: 410087041}
   - {fileID: 832575519}
   - {fileID: 847526911}
+  - {fileID: 429486327}
