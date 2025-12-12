@@ -1,127 +1,178 @@
-# Geospatial-Gaussian-VR
-Immersive VR visualization of large-scale geospatial point clouds using Gaussian Splatting, Unity OpenXR, and geospatial processing (TUM Geodesy &amp; Geoinformation Master Thesis).
+Geospatial-Gaussian-VR
 
-📌 Current Pipeline Overview (NavVis → Gaussian → Unity GPU Renderer)
+Immersive Geospatial Point Cloud Visualization in Virtual Reality Based on Gaussian Splatting
 
-This repository implements a complete end-to-end pipeline for transforming real-world geospatial point clouds into Gaussian primitives and rendering them in Unity using GPU procedural drawing.
-The current stage provides a working demo using NavVis VLX indoor–outdoor scan data (“House 2 / Lichtblick”).
+This repository contains the implementation of a chunked, LOD-enabled, and streamable Gaussian point cloud rendering pipeline, developed as part of a master’s thesis project.
+The current version focuses on a NavVis indoor scan demo, providing a scalable runtime foundation for future Gaussian Splatting rendering and VR integration.
 
 ⸻
 
-1. Point Cloud Preprocessing (CloudCompare)
+Project Overview
+
+The goal of this project is to build a real-time, immersive visualization system for large-scale geospatial point clouds, targeting VR environments.
+The system combines:
+	•	Gaussian-based point representations
+	•	Spatial chunking
+	•	Distance-based LOD selection
+	•	Frustum culling
+	•	Runtime chunk streaming
+
+The project is implemented using Python (offline preprocessing) and Unity (runtime rendering), and is designed to scale from small indoor scenes to large datasets such as TUM2Twin.
+
+⸻
+
+Current Status (v0.1 – NavVis Demo)
+
+✅ Offline Gaussian construction pipeline
+✅ Spatial chunking and LOD generation
+✅ Unity runtime loading of chunked Gaussian point clouds
+✅ Frustum culling
+✅ Distance-based LOD switching (L0 / L1 / L2)
+✅ Runtime chunk streaming (GPU buffer load / unload)
+✅ Stable point-based rendering with per-chunk material instances
+
+🚧 Gaussian splatting (soft splats) – not yet implemented
+🚧 VR integration (OpenXR) – planned
+🚧 TUM2Twin large-scale dataset migration – planned
+
+⸻
+
+Pipeline Overview
+
+1. Data Preparation (CloudCompare)
+
+Raw NavVis point clouds are preprocessed using CloudCompare:
+	•	Segmentation (extract indoor blocks / rooms)
+	•	Statistical Outlier Removal (SOR)
+	•	Spatial Subsampling (density control)
+
+Output: Cleaned .ply files
+
+⸻
+
+2. Gaussian Primitive Construction (Python)
+
+gaussian_builder.py converts cleaned point clouds into Gaussian primitives.
 
 Input:
-SampleHouse1ScannedWithNavVisVLX.e57
+	•	.ply
 
-Processing steps performed in CloudCompare:
-	1.	Import raw point cloud
-File → Open → .e57
-	2.	Noise filtering
-Edit → Noise → SOR Filter
-Removes outliers and scanning artifacts.
-	3.	Spatial downsampling
-Edit → Subsample → Spatial
-Reduces point density while keeping uniform structure.
-	4.	Shift to local origin
-Global navigation coordinate → local ENU-like system:
-Edit → Apply Transformation → Translate → -GlobalShift
-	5.	Export to PLY
-File → Save → .ply
-Exported file used for Gaussian construction:
-data/navvis_house2_centered.ply
+Output:
+	•	.npz – full Gaussian parameters (position, scale, rotation, color)
+	•	.txt – simplified Gaussian data for Unity demo rendering
 
-✔ Result: Clean, normalized, centered point cloud ready for Python processing.
+Key parameters:
+	•	MAX_GAUSSIANS
+	•	K_NEIGHBORS_ISO / K_NEIGHBORS_ANISO
+	•	S_MIN / S_MAX (scale clamping)
 
 ⸻
 
-2. Gaussian Construction (Python + Open3D)
+3. Spatial Chunking (Python)
 
-Script:
-preprocessing/gaussian_builder.py
+chunking_navvis.py splits a Gaussian point cloud into fixed-size 3D grid chunks.
 
-Pipeline Steps
-	1.	Load centered PLY using Open3D
-	2.	Random sampling of up to 50,000 points for real-time demo
-	3.	Compute local Gaussian scales
-	•	Build KDTree
-	•	For each point:
-	•	Query K=8 nearest neighbors
-	•	Estimate local density → derive isotropic Gaussian scale
-	4.	Initialize rotations as identity (anisotropic Gaussians planned for future stage)
-	5.	Normalize colors to [0,1]
-	6.	Save Gaussian parameters in two formats:
-	•	navvis_house2_gaussians_demo.npz
-(full research format — positions, scales, rotations, opacity)
-	•	navvis_house2_gaussians_demo.txt
-(Unity procedural renderer input)
+Input:
+	•	Gaussian .npz
 
-Unity TXT Format
-
-Each line:
-
-x  y  z   sx  sy  sz   r  g  b
-
-✔ Result: Lightweight Gaussian point representation suitable for fast GPU loading.
+Output:
+	•	navvis_chunk_ix_iy_iz.txt
+	•	Chunk metadata
+	•	Chunk index JSON (bounding boxes, centers, point counts)
 
 ⸻
 
-3. Unity GPU Point Renderer (ComputeBuffer + Procedural Draw)
+4. LOD Generation (Python)
 
-Project:
-vr-renderer/
+lod_builder.py generates multiple Levels of Detail for each chunk.
 
-Key components
+Output per chunk:
+	•	*_L0.txt – full resolution
+	•	*_L1.txt – subsampled
+	•	*_L2.txt – coarse
 
-3.1 Data loading (C#)
-Script: Assets/Scripts/GaussianLoader.cs
-	•	Reads TXT from Assets/StreamingAssets/
-	•	Parses position and color arrays
-	•	Uploads to GPU via ComputeBuffer
-	•	Sets shader uniforms:
-	•	_Positions
-	•	_Colors
-	•	_PointSize
-	•	_LocalToWorld
-
-3.2 Shader (HLSL)
-File: Assets/Shaders/GaussianPoints.shader
-	•	Uses StructuredBuffer<float3> for positions & colors
-	•	Vertex stage computes clip-space location
-	•	Fragment pass outputs per-point color
-	•	Procedural drawing:
-
-Graphics.DrawProceduralNow(MeshTopology.Points, numPoints);
-
-3.3 Scene Setup
-	•	Empty GameObject GaussianRenderer
-	•	Position (0,0,0)
-	•	Rotation (-90,0,0) to convert Z-up → Unity Y-up
-	•	Attached script: GaussianLoader.cs
-	•	navvis_house2_gaussians_demo.txt placed in StreamingAssets
-
-3.4 Runtime
-	•	Press Play → the NavVis Gaussian cloud is rendered in real-time.
-
-✔ Result: Working real-time Gaussian point renderer with Unity GPU pipeline.
+A new navvis_chunks_lod_index.json is generated for runtime LOD and streaming.
 
 ⸻
 
-4. Current Capabilities
-	•	End-to-end NavVis point cloud pipeline
-	•	Gaussian primitive generation (isotropic v0)
-	•	Real-time rendering (50k points)
-	•	GPU procedural pipeline (ComputeBuffer + DrawProceduralNow)
-	•	Axis-aligned, scaled, colored point cloud
-	•	Camera aligned using SceneView → Align With View workflow
-	•	Stable reproducible demo scene
+5. Runtime Rendering (Unity)
+
+GaussianLoader.cs
+	•	Loads Gaussian .txt files
+	•	Uploads data to GPU via ComputeBuffer
+	•	Renders point clouds using DrawProceduralNow
+	•	Supports reload / unload for LOD switching and streaming
+	•	Uses per-instance material copies to avoid GPU buffer conflicts
+
+GaussianChunkManager.cs
+	•	Loads LOD index JSON
+	•	Instantiates chunk GameObjects and GaussianLoaders
+	•	Performs per-frame:
+	•	Frustum culling
+	•	Distance-based LOD selection
+	•	Chunk streaming (load / unload)
+	•	Provides global point size control
+
+Shader
+	•	Point-based rendering with:
+	•	Distance-aware screen-space point sizing
+	•	Per-point Gaussian scale (sx)
+	•	Correct clip-space transformation (no double model matrix application)
 
 ⸻
 
-5. Next Steps (Planned in Thesis)
-	•	⚡ True Gaussian Splatting (screen-space footprint + falloff)
-	•	⚡ VR Integration (OpenXR + Vive Pro 2)
-	•	⚡ Chunking + LOD system for large geospatial clouds
-	•	⚡ Anisotropic covariance-based Gaussians
-	•	⚡ Real-time frustum culling & streaming
-	•	⚡ Support for TUM2Twin city-scale datasets
+Repository Structure
 
+Geospatial-Gaussian-VR/
+├── preprocessing/          # Python offline pipeline
+├── vr-renderer/            # Unity project
+│   ├── Assets/
+│   │   ├── Scripts/
+│   │   ├── Shaders/
+│   │   └── StreamingAssets/
+│   └── ProjectSettings/
+├── docs/
+├── README.md
+
+Note: Large point cloud data and chunk files are intentionally excluded from version control.
+
+⸻
+
+Requirements
+
+Python
+	•	Python 3.8+
+	•	numpy
+	•	open3d
+
+Unity
+	•	Unity 2021 LTS or newer
+	•	OpenGL / DirectX 11 compatible GPU
+
+⸻
+
+Roadmap
+	•	Gaussian Splatting rendering (billboard / compute shader)
+	•	Stereo rendering and VR integration (OpenXR, Vive Pro 2)
+	•	Performance evaluation and benchmarking
+	•	Migration to TUM2Twin large-scale datasets
+
+⸻
+
+License
+
+This project is developed for academic research purposes.
+Dataset licenses (NavVis, TUM2Twin) apply separately.
+
+⸻
+
+Acknowledgements
+	•	Kerbl et al., 3D Gaussian Splatting for Real-Time Radiance Field Rendering
+	•	CityGaussian / CityGaussianV2
+	•	TUM2Twin Project
+	•	Open3D
+	•	Unity Technologies
+
+git push origin main
+
+如果你愿意，下一步我可以帮你把 README 直接精炼成 thesis Chapter 3（Implementation）英文版，或者写一个 docs/pipeline.md 图文说明版。
