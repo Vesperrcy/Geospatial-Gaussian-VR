@@ -11,7 +11,7 @@ INPUT_PATH = Path("data/SampleBlock1.ply")
 OUTPUT_PATH = Path("data/SampleBlock1_gaussians_demo.npz")
 
 # 用于 demo 的最大高斯数量（开发阶段可以改小一点，比如 20000，加速调试）
-MAX_GAUSSIANS = 20000
+MAX_GAUSSIANS = 200000
 
 # 用于估计各向同性尺度的邻域大小
 K_NEIGHBORS_ISO = 8

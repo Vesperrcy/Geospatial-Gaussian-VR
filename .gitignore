@@ -32,3 +32,43 @@ data/*.zip
 
 # OS Files
 .DS_Store
+
+cat > .gitignore << 'EOF'
+# mac
+.DS_Store
+
+# python cache
+__pycache__/
+*.pyc
+
+# 输出数据（点云 / chunk / LOD）
+data/
+*.npz
+
+# Unity StreamingAssets 里的运行期数据
+vr-renderer/Assets/StreamingAssets/navvis_chunks*/
+vr-renderer/Assets/StreamingAssets/navvis_chunks*/
+vr-renderer/Assets/StreamingAssets/*_gaussians_demo.txt
+EOF
+
+# Unity
+[Ll]ibrary/
+[Tt]emp/
+[Oo]bj/
+[Bb]uild/
+[Bb]uilds/
+[Ll]ogs/
+UserSettings/
+
+# OS
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+
+# Data (important!)
+*.npz
+*.txt
+StreamingAssets/navvis_chunks_Block1/*
+!StreamingAssets/navvis_chunks_Block1/README.md

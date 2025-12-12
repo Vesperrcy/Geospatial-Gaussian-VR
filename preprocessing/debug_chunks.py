@@ -1,8 +1,8 @@
 import numpy as np
 from pathlib import Path
 
-NPZ_PATH = Path("data/navvis_house2_gaussians_demo.npz")
-CHUNK_DIR = Path("data/navvis_chunks")
+NPZ_PATH = Path("data/SampleBlock1_gaussians_demo.npz")
+CHUNK_DIR = Path("data/navvis_chunks_Block1")
 CHUNK_PREFIX = "navvis_chunk_"
 CHUNK_SUFFIX = ".txt"
 
@@ -19,7 +19,9 @@ def main():
     print(f"[INFO] Original Gaussians: {n_orig} points\n")
 
     # 找到所有 chunk txt 文件
-    chunk_files = sorted(CHUNK_DIR.glob(f"{CHUNK_PREFIX}*{CHUNK_SUFFIX}"))
+    # 找到所有 chunk txt 文件（只要原始的，不要 L0/L1/L2）
+    all_files = CHUNK_DIR.glob(f"{CHUNK_PREFIX}*{CHUNK_SUFFIX}")
+    chunk_files = sorted(f for f in all_files if "_L" not in f.stem)
     print(f"[INFO] Found {len(chunk_files)} chunk files.")
 
     total = 0

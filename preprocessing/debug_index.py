@@ -1,7 +1,7 @@
 import json
 from pathlib import Path
 
-INDEX_PATH = Path("data/navvis_chunks/navvis_chunks_index.json")
+INDEX_PATH = Path("data/navvis_chunks_Block1/navvis_chunks_index.json")
 
 def main():
     print("=== Debug Chunk Index ===")

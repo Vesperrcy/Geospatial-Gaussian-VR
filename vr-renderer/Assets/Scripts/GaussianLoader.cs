@@ -6,7 +6,7 @@ using UnityEngine;
 public class GaussianLoader : MonoBehaviour
 {
     [Header("Data file (relative to StreamingAssets)")]
-    // 例如： "navvis_house2_gaussians_demo.txt"
+    // 例如： "SampleBlock1_gaussians_demo.txt"
     public string dataFileName = "SampleBlock1_gaussians_demo.txt";
 
     [Header("Rendering")]
@@ -19,28 +19,73 @@ public class GaussianLoader : MonoBehaviour
     public bool treatInputAsWorldSpace = false;
     public Vector3 chunkCenterWorld = Vector3.zero;
 
+    // === GPU buffers ===
     private ComputeBuffer _positionBuffer;
     private ComputeBuffer _colorBuffer;
+    private ComputeBuffer _scaleBuffer;   // 每个点的 sx
+
     private int _numPoints;
+
+    // 每个 Loader 自己持有一份材质实例，避免多个 Loader 共用同一个 Material 导致 SetBuffer 互相覆盖
+    private Material _runtimeMaterial;
 
     void Start()
     {
-        //Application.targetFrameRate = 90;
-        // 把物体放到 chunkCenterWorld 位置
+        if (pointMaterial == null)
+        {
+            Debug.LogError("[GaussianLoader] pointMaterial is not assigned!");
+            return;
+        }
+
+        // 为每个 Loader 克隆一个独立的材质实例，避免多个 Loader 共用同一个 Material
+        _runtimeMaterial = new Material(pointMaterial);
+
+        // 把物体放到 chunkCenterWorld 位置（只在 treatInputAsWorldSpace=true 时生效）
         if (treatInputAsWorldSpace)
         {
             transform.position = chunkCenterWorld;
         }
+
         LoadData();
         SetupMaterial();
     }
 
-    void LoadData()
+    /// <summary>
+    /// 被 ChunkManager 调用，用于切换 LOD 时重新加载不同 txt。
+    /// </summary>
+    public void ReloadData()
     {
-        Debug.Log($"[GaussianLoader] === LoadData START ===");
-        Debug.Log($"[GaussianLoader] dataFileName = {dataFileName}");
-        Debug.Log($"[GaussianLoader] treatInputAsWorldSpace = {treatInputAsWorldSpace}");
-        Debug.Log($"[GaussianLoader] chunkCenterWorld = {chunkCenterWorld}");
+        _positionBuffer?.Release();
+        _colorBuffer?.Release();
+        _scaleBuffer?.Release();
+
+        _positionBuffer = null;
+        _colorBuffer = null;
+        _scaleBuffer = null;
+        _numPoints = 0;
+
+        LoadData();
+        SetupMaterial();
+    }
+
+    /// <summary>
+    /// 被 ChunkManager 调用，用于 Chunk Streaming：远处卸载 chunk，释放 GPU 资源。
+    /// </summary>
+    public void UnloadData()
+    {
+        _positionBuffer?.Release();
+        _colorBuffer?.Release();
+        _scaleBuffer?.Release();
+
+        _positionBuffer = null;
+        _colorBuffer = null;
+        _scaleBuffer = null;
+        _numPoints = 0;
+    }
+
+    private void LoadData()
+    {
+        Debug.Log($"[GaussianLoader] LoadData: {dataFileName}");
 
         if (string.IsNullOrEmpty(dataFileName))
         {
@@ -49,8 +94,6 @@ public class GaussianLoader : MonoBehaviour
         }
 
         string path = Path.Combine(Application.streamingAssetsPath, dataFileName);
-        Debug.Log($"[GaussianLoader] Loading data from: {path}");
-
         if (!File.Exists(path))
         {
             Debug.LogError("[GaussianLoader] File not found: " + path);
@@ -58,12 +101,12 @@ public class GaussianLoader : MonoBehaviour
         }
 
         List<Vector3> positions = new();
-        List<Vector3> colors = new();
+        List<Vector3> colors    = new();
+        List<float>   scales    = new();   // 存每个点的 sx
 
         var lines = File.ReadAllLines(path);
-        Debug.Log($"[GaussianLoader] File contains {lines.Length} lines.");
-
         int lineIndex = 0;
+
         foreach (var line in lines)
         {
             lineIndex++;
@@ -73,44 +116,22 @@ public class GaussianLoader : MonoBehaviour
             var t = line.Split((char[])null, System.StringSplitOptions.RemoveEmptyEntries);
             if (t.Length < 9)
             {
-                Debug.LogWarning($"[GaussianLoader] Line {lineIndex} malformed: {line}");
+                // 行格式不对就跳过
                 continue;
             }
 
-            // ---- ① 输入原始坐标检查 ----
             float x = float.Parse(t[0], CultureInfo.InvariantCulture);
             float y = float.Parse(t[1], CultureInfo.InvariantCulture);
             float z = float.Parse(t[2], CultureInfo.InvariantCulture);
 
-            if (lineIndex <= 3)  // 只打印前三行，避免刷屏
-            {
-                Debug.Log($"[GaussianLoader] Raw P[{lineIndex}] = ({x:F3}, {y:F3}, {z:F3})");
-            }
+            // sx sy sz：目前我们只用 sx（各向同性半径），sy/sz 暂时忽略
+            float sx = float.Parse(t[3], CultureInfo.InvariantCulture);
 
             Vector3 pWorld = new Vector3(x, y, z);
-            Vector3 pLocal;
-
-            // ---- ② 坐标变换检查 ----
-            if (treatInputAsWorldSpace)
-            {
-                pLocal = pWorld - chunkCenterWorld;
-
-                if (lineIndex <= 3)
-                {
-                    Debug.Log($"[GaussianLoader] pLocal = pWorld - chunkCenterWorld = {pLocal}");
-                }
-            }
-            else
-            {
-                pLocal = pWorld;
-
-                if (lineIndex <= 3)
-                {
-                    Debug.Log($"[GaussianLoader] pLocal = pWorld (no transform) = {pLocal}");
-                }
-            }
+            Vector3 pLocal = treatInputAsWorldSpace ? (pWorld - chunkCenterWorld) : pWorld;
 
             positions.Add(pLocal);
+            scales.Add(sx);
 
             float r = float.Parse(t[6], CultureInfo.InvariantCulture);
             float g = float.Parse(t[7], CultureInfo.InvariantCulture);
@@ -119,58 +140,66 @@ public class GaussianLoader : MonoBehaviour
         }
 
         _numPoints = positions.Count;
-        Debug.Log($"[GaussianLoader] Loaded {_numPoints} points.");
-        Debug.Log($"[GaussianLoader] Sample pLocal[0] = {positions[0]}");
-
         if (_numPoints == 0)
         {
-            Debug.LogError("[GaussianLoader] No valid points loaded.");
+            Debug.LogError($"[GaussianLoader] No valid points loaded from {dataFileName}");
             return;
         }
-
-        // ---- ③ 缓冲区创建检查 ----
-        Debug.Log($"[GaussianLoader] Creating buffers: {_numPoints} points");
 
         _positionBuffer = new ComputeBuffer(_numPoints, sizeof(float) * 3);
-        _colorBuffer = new ComputeBuffer(_numPoints, sizeof(float) * 3);
-
         _positionBuffer.SetData(positions);
+
+        _colorBuffer = new ComputeBuffer(_numPoints, sizeof(float) * 3);
         _colorBuffer.SetData(colors);
 
-        Debug.Log($"[GaussianLoader] === LoadData DONE ===");
+        _scaleBuffer = new ComputeBuffer(_numPoints, sizeof(float));
+        _scaleBuffer.SetData(scales);
+
+        Debug.Log($"[GaussianLoader] Loaded {_numPoints} points.");
     }
 
-    void SetupMaterial()
+    private void SetupMaterial()
     {
-        if (pointMaterial == null)
+        if (_runtimeMaterial == null)
         {
-            Debug.LogError("[GaussianLoader] pointMaterial is not assigned!");
+            Debug.LogError("[GaussianLoader] _runtimeMaterial is null in SetupMaterial");
             return;
         }
 
-        pointMaterial.SetBuffer("_Positions", _positionBuffer);
-        pointMaterial.SetBuffer("_Colors",   _colorBuffer);
-        pointMaterial.SetFloat("_PointSize", pointSize);
+        _runtimeMaterial.SetBuffer("_Positions", _positionBuffer);
+        _runtimeMaterial.SetBuffer("_Colors",    _colorBuffer);
+        _runtimeMaterial.SetFloat("_PointSize",  pointSize);
+
+        if (_scaleBuffer != null)
+        {
+            _runtimeMaterial.SetBuffer("_Scales", _scaleBuffer);
+        }
     }
 
-    void OnRenderObject()
+    private void OnRenderObject()
     {
-        if (_positionBuffer == null || pointMaterial == null || _numPoints == 0)
+        if (_positionBuffer == null || _runtimeMaterial == null || _numPoints == 0)
             return;
 
-        // 这里的 Transform 就是：
         // 单文件 demo：GaussianRenderer 的 transform
-        // chunk 模式：每个 Chunk_* GameObject 的 transform（position = chunk center）
-        pointMaterial.SetMatrix("_LocalToWorld", transform.localToWorldMatrix);
-        pointMaterial.SetFloat("_PointSize", pointSize);
-        pointMaterial.SetPass(0);
+        // chunk 模式：每个 Chunk_* GameObject 的 transform（position = chunk center 或世界原点）
+        _runtimeMaterial.SetMatrix("_LocalToWorld", transform.localToWorldMatrix);
+        _runtimeMaterial.SetFloat("_PointSize", pointSize);
+        _runtimeMaterial.SetPass(0);
 
         Graphics.DrawProceduralNow(MeshTopology.Points, _numPoints);
     }
 
-    void OnDestroy()
+    private void OnDestroy()
     {
         _positionBuffer?.Release();
         _colorBuffer?.Release();
+        _scaleBuffer?.Release();
+
+        if (_runtimeMaterial != null)
+        {
+            Destroy(_runtimeMaterial);
+            _runtimeMaterial = null;
+        }
     }
 }
