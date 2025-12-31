@@ -11,7 +11,7 @@ INPUT_PATH = Path("data/SampleBlock1.ply")
 OUTPUT_PATH = Path("data/SampleBlock1_gaussians_demo.npz")
 
 # 用于 demo 的最大高斯数量（开发阶段可以改小一点，比如 20000，加速调试）
-MAX_GAUSSIANS = 200000
+MAX_GAUSSIANS = 20000
 
 # 用于估计各向同性尺度的邻域大小
 K_NEIGHBORS_ISO = 8
@@ -51,6 +51,22 @@ def compute_isotropic_scales(points, kdtree, k_neighbors):
     print(f"  mean={dist_arr.mean():.4f}")
     for q in [5, 25, 50, 75, 95]:
         print(f"  {q}th percentile = {np.percentile(dist_arr, q):.4f}")
+
+    # Additional statistics: neighbor distance vs Gaussian scale
+    neighbor_dist = dist_arr / 0.75  # reverse the empirical factor to approximate mean neighbor distance
+
+    print("[INFO] Neighbor distance vs Gaussian scale analysis:")
+    print(f"  mean neighbor distance = {neighbor_dist.mean():.4f} m")
+    print(f"  mean isotropic scale   = {dist_arr.mean():.4f} m")
+    print(f"  ratio (neighbor / scale) = {neighbor_dist.mean() / dist_arr.mean():.2f}")
+
+    print("  neighbor distance percentiles (m):")
+    for q in [5, 25, 50, 75, 95]:
+        print(f"    {q}th = {np.percentile(neighbor_dist, q):.4f}")
+
+    print("  isotropic scale percentiles (m):")
+    for q in [5, 25, 50, 75, 95]:
+        print(f"    {q}th = {np.percentile(dist_arr, q):.4f}")
 
     return scales_iso
 

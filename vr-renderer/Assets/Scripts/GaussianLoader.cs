@@ -6,27 +6,29 @@ using UnityEngine;
 public class GaussianLoader : MonoBehaviour
 {
     [Header("Data file (relative to StreamingAssets)")]
-    // 例如： "SampleBlock1_gaussians_demo.txt"
     public string dataFileName = "SampleBlock1_gaussians_demo.txt";
 
     [Header("Rendering")]
     public Material pointMaterial;
     public float pointSize = 1.0f;
 
+    [Tooltip("If enabled, render each point as a camera-facing quad with Gaussian alpha (splatting).")]
+    public bool renderAsSplatQuads = true;
+
+    [Header("Splatting (shader params)")]
+    public float gaussianSharpness = 8.0f;
+    [Range(0f, 1f)] public float globalAlpha = 1.0f;
+
     [Header("Chunk options")]
-    // 如果为 true：文件中的 xyz 当作世界坐标，需要减去 chunkCenterWorld 变成本地坐标
-    // 如果为 false：xyz 直接当作本地坐标使用
     public bool treatInputAsWorldSpace = false;
     public Vector3 chunkCenterWorld = Vector3.zero;
 
-    // === GPU buffers ===
     private ComputeBuffer _positionBuffer;
     private ComputeBuffer _colorBuffer;
-    private ComputeBuffer _scaleBuffer;   // 每个点的 sx
+    private ComputeBuffer _scaleBuffer;
 
     private int _numPoints;
 
-    // 每个 Loader 自己持有一份材质实例，避免多个 Loader 共用同一个 Material 导致 SetBuffer 互相覆盖
     private Material _runtimeMaterial;
 
     void Start()
@@ -37,10 +39,8 @@ public class GaussianLoader : MonoBehaviour
             return;
         }
 
-        // 为每个 Loader 克隆一个独立的材质实例，避免多个 Loader 共用同一个 Material
         _runtimeMaterial = new Material(pointMaterial);
 
-        // 把物体放到 chunkCenterWorld 位置（只在 treatInputAsWorldSpace=true 时生效）
         if (treatInputAsWorldSpace)
         {
             transform.position = chunkCenterWorld;
@@ -50,27 +50,13 @@ public class GaussianLoader : MonoBehaviour
         SetupMaterial();
     }
 
-    /// <summary>
-    /// 被 ChunkManager 调用，用于切换 LOD 时重新加载不同 txt。
-    /// </summary>
     public void ReloadData()
     {
-        _positionBuffer?.Release();
-        _colorBuffer?.Release();
-        _scaleBuffer?.Release();
-
-        _positionBuffer = null;
-        _colorBuffer = null;
-        _scaleBuffer = null;
-        _numPoints = 0;
-
+        UnloadData();
         LoadData();
         SetupMaterial();
     }
 
-    /// <summary>
-    /// 被 ChunkManager 调用，用于 Chunk Streaming：远处卸载 chunk，释放 GPU 资源。
-    /// </summary>
     public void UnloadData()
     {
         _positionBuffer?.Release();
@@ -101,30 +87,24 @@ public class GaussianLoader : MonoBehaviour
         }
 
         List<Vector3> positions = new();
-        List<Vector3> colors    = new();
-        List<float>   scales    = new();   // 存每个点的 sx
+        List<Vector3> colors = new();
+        List<float> scales = new();
 
         var lines = File.ReadAllLines(path);
-        int lineIndex = 0;
 
         foreach (var line in lines)
         {
-            lineIndex++;
             if (string.IsNullOrWhiteSpace(line))
                 continue;
 
             var t = line.Split((char[])null, System.StringSplitOptions.RemoveEmptyEntries);
             if (t.Length < 9)
-            {
-                // 行格式不对就跳过
                 continue;
-            }
 
             float x = float.Parse(t[0], CultureInfo.InvariantCulture);
             float y = float.Parse(t[1], CultureInfo.InvariantCulture);
             float z = float.Parse(t[2], CultureInfo.InvariantCulture);
 
-            // sx sy sz：目前我们只用 sx（各向同性半径），sy/sz 暂时忽略
             float sx = float.Parse(t[3], CultureInfo.InvariantCulture);
 
             Vector3 pWorld = new Vector3(x, y, z);
@@ -166,35 +146,51 @@ public class GaussianLoader : MonoBehaviour
             return;
         }
 
-        _runtimeMaterial.SetBuffer("_Positions", _positionBuffer);
-        _runtimeMaterial.SetBuffer("_Colors",    _colorBuffer);
-        _runtimeMaterial.SetFloat("_PointSize",  pointSize);
-
-        if (_scaleBuffer != null)
+        if (_positionBuffer == null || _colorBuffer == null || _scaleBuffer == null)
         {
-            _runtimeMaterial.SetBuffer("_Scales", _scaleBuffer);
+            Debug.LogError($"[GaussianLoader] Missing ComputeBuffer(s) for {dataFileName}. " +
+                           $"pos={(_positionBuffer != null)} col={(_colorBuffer != null)} scale={(_scaleBuffer != null)}");
+            return;
         }
+
+        _runtimeMaterial.SetBuffer("_Positions", _positionBuffer);
+        _runtimeMaterial.SetBuffer("_Colors", _colorBuffer);
+        _runtimeMaterial.SetBuffer("_Scales", _scaleBuffer);
+
+        _runtimeMaterial.SetFloat("_PointSize", pointSize);
+        _runtimeMaterial.SetFloat("_Sharpness", gaussianSharpness);
+        _runtimeMaterial.SetFloat("_Alpha", globalAlpha);
     }
 
     private void OnRenderObject()
     {
-        if (_positionBuffer == null || _runtimeMaterial == null || _numPoints == 0)
+        if (_runtimeMaterial == null || _numPoints == 0 || _positionBuffer == null || _colorBuffer == null)
             return;
 
-        // 单文件 demo：GaussianRenderer 的 transform
-        // chunk 模式：每个 Chunk_* GameObject 的 transform（position = chunk center 或世界原点）
+        if (renderAsSplatQuads && _scaleBuffer == null)
+            return;
+
         _runtimeMaterial.SetMatrix("_LocalToWorld", transform.localToWorldMatrix);
         _runtimeMaterial.SetFloat("_PointSize", pointSize);
+        _runtimeMaterial.SetFloat("_Sharpness", gaussianSharpness);
+        _runtimeMaterial.SetFloat("_Alpha", globalAlpha);
+
         _runtimeMaterial.SetPass(0);
 
-        Graphics.DrawProceduralNow(MeshTopology.Points, _numPoints);
+        if (renderAsSplatQuads)
+        {
+            int vertexCount = _numPoints * 6;
+            Graphics.DrawProceduralNow(MeshTopology.Triangles, vertexCount);
+        }
+        else
+        {
+            Graphics.DrawProceduralNow(MeshTopology.Points, _numPoints);
+        }
     }
 
     private void OnDestroy()
     {
-        _positionBuffer?.Release();
-        _colorBuffer?.Release();
-        _scaleBuffer?.Release();
+        UnloadData();
 
         if (_runtimeMaterial != null)
         {

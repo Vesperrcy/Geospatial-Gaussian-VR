@@ -21,8 +21,40 @@ public class GaussianChunkManager : MonoBehaviour
     public string lodIndexFileName = "navvis_chunks_lod_index.json";
 
     [Header("Rendering")]
-    public Material pointMaterial;      // 传给 GaussianLoader
-    public float pointSize = 1.0f;      // 传给 GaussianLoader
+    public Material pointMaterial;      // Passed to GaussianLoader
+
+    [Header("Splatting (applied per LOD)")]
+    public bool renderAsSplatQuads = true;
+
+    [Tooltip("World-space splat size multiplier for LOD0.")]
+    public float pointSizeL0 = 2.0f;
+
+    [Tooltip("World-space splat size multiplier for LOD1.")]
+    public float pointSizeL1 = 3.5f;
+
+    [Tooltip("World-space splat size multiplier for LOD2.")]
+    public float pointSizeL2 = 6.0f;
+
+    [Tooltip("Gaussian falloff sharpness for LOD0.")]
+    public float gaussianSharpnessL0 = 18.0f;
+
+    [Tooltip("Gaussian falloff sharpness for LOD1.")]
+    public float gaussianSharpnessL1 = 22.0f;
+
+    [Tooltip("Gaussian falloff sharpness for LOD2.")]
+    public float gaussianSharpnessL2 = 28.0f;
+
+    [Range(0f, 1f)]
+    [Tooltip("Global alpha multiplier for LOD0.")]
+    public float globalAlphaL0 = 0.6f;
+
+    [Range(0f, 1f)]
+    [Tooltip("Global alpha multiplier for LOD1.")]
+    public float globalAlphaL1 = 0.35f;
+
+    [Range(0f, 1f)]
+    [Tooltip("Global alpha multiplier for LOD2.")]
+    public float globalAlphaL2 = 0.18f;
 
     [Header("LOD distances (meters)")]
     public float lod0To1 = 5f;          // < lod0To1 使用 L0
@@ -104,8 +136,11 @@ public float unloadRadius = 40f;
     // 记录每个 chunk 当前是否已加载 GPU 数据（用于 Streaming）
     private readonly List<bool> _isLoaded = new();
 
-    // 记录上一次应用到所有 ChunkLoader 的 pointSize，用于检测 Inspector 中的变化
-    private float _lastAppliedPointSize = -1f;
+    // Cache last applied Inspector values to avoid per-frame churn
+    private bool _lastRenderAsSplatQuads;
+    private float _lastPointSizeL0, _lastPointSizeL1, _lastPointSizeL2;
+    private float _lastSharpnessL0, _lastSharpnessL1, _lastSharpnessL2;
+    private float _lastAlphaL0, _lastAlphaL1, _lastAlphaL2;
 
     private void Start()
     {
@@ -113,25 +148,84 @@ public float unloadRadius = 40f;
         {
             LoadLODIndex();
             InitChunks_L0_Only();
+            CacheSplatParams();
         }
     }
 
-    /// <summary>
-    /// 将当前 Manager 的 pointSize 同步到所有已创建的 GaussianLoader。
-    /// 仅在 pointSize 有变化时调用即可。
-    /// </summary>
-    private void ApplyPointSizeToLoaders()
+    private void ApplySplatParamsToLoader(GaussianLoader loader, int lodLevel)
     {
-        if (_chunkLoaders == null || _chunkLoaders.Count == 0)
-            return;
+        if (loader == null) return;
 
-        foreach (var loader in _chunkLoaders)
+        loader.renderAsSplatQuads = renderAsSplatQuads;
+
+        switch (lodLevel)
         {
-            if (loader == null) continue;
-            loader.pointSize = pointSize;
+            case 0:
+                loader.pointSize = pointSizeL0;
+                loader.gaussianSharpness = gaussianSharpnessL0;
+                loader.globalAlpha = globalAlphaL0;
+                break;
+            case 1:
+                loader.pointSize = pointSizeL1;
+                loader.gaussianSharpness = gaussianSharpnessL1;
+                loader.globalAlpha = globalAlphaL1;
+                break;
+            default:
+                loader.pointSize = pointSizeL2;
+                loader.gaussianSharpness = gaussianSharpnessL2;
+                loader.globalAlpha = globalAlphaL2;
+                break;
+        }
+    }
+
+    private bool SplatParamsChanged()
+    {
+        if (_lastRenderAsSplatQuads != renderAsSplatQuads) return true;
+
+        if (!Mathf.Approximately(_lastPointSizeL0, pointSizeL0) ||
+            !Mathf.Approximately(_lastPointSizeL1, pointSizeL1) ||
+            !Mathf.Approximately(_lastPointSizeL2, pointSizeL2)) return true;
+
+        if (!Mathf.Approximately(_lastSharpnessL0, gaussianSharpnessL0) ||
+            !Mathf.Approximately(_lastSharpnessL1, gaussianSharpnessL1) ||
+            !Mathf.Approximately(_lastSharpnessL2, gaussianSharpnessL2)) return true;
+
+        if (!Mathf.Approximately(_lastAlphaL0, globalAlphaL0) ||
+            !Mathf.Approximately(_lastAlphaL1, globalAlphaL1) ||
+            !Mathf.Approximately(_lastAlphaL2, globalAlphaL2)) return true;
+
+        return false;
+    }
+
+    private void CacheSplatParams()
+    {
+        _lastRenderAsSplatQuads = renderAsSplatQuads;
+
+        _lastPointSizeL0 = pointSizeL0;
+        _lastPointSizeL1 = pointSizeL1;
+        _lastPointSizeL2 = pointSizeL2;
+
+        _lastSharpnessL0 = gaussianSharpnessL0;
+        _lastSharpnessL1 = gaussianSharpnessL1;
+        _lastSharpnessL2 = gaussianSharpnessL2;
+
+        _lastAlphaL0 = globalAlphaL0;
+        _lastAlphaL1 = globalAlphaL1;
+        _lastAlphaL2 = globalAlphaL2;
+    }
+
+    private void ApplySplatParamsToAllLoaders()
+    {
+        if (_chunkLoaders == null || _chunkLoaders.Count == 0) return;
+
+        for (int i = 0; i < _chunkLoaders.Count; i++)
+        {
+            var loader = _chunkLoaders[i];
+            int lod = (i < _currentLOD.Count) ? _currentLOD[i] : 0;
+            ApplySplatParamsToLoader(loader, lod);
         }
 
-        _lastAppliedPointSize = pointSize;
+        CacheSplatParams();
     }
 
     /// <summary>
@@ -249,8 +343,8 @@ public float unloadRadius = 40f;
             string relativePath = Path.Combine(chunksFolderName, l0FileName);
             loader.dataFileName = relativePath;
             loader.pointMaterial = pointMaterial;
-            loader.pointSize = pointSize;
             loader.treatInputAsWorldSpace = true;
+            ApplySplatParamsToLoader(loader, 0);
 
             _chunkLoaders.Add(loader);
             _chunkEntries.Add(entry);
@@ -266,8 +360,8 @@ public float unloadRadius = 40f;
             }
         }
 
-        // 初始化完成后，把当前 Manager 的 pointSize 应用到所有 ChunkLoader
-        ApplyPointSizeToLoaders();
+        // Apply current Inspector splat params to all loaders
+        ApplySplatParamsToAllLoaders();
 
         Debug.Log($"[GaussianChunkManager] Created {created} Gaussian chunk loaders.");
     }
@@ -297,10 +391,10 @@ public float unloadRadius = 40f;
 
     private void Update()
     {
-        // 1) pointSize 同步
-        if (!Mathf.Approximately(_lastAppliedPointSize, pointSize))
+        // 1) Sync splat params (only when Inspector values change)
+        if (SplatParamsChanged())
         {
-            ApplyPointSizeToLoaders();
+            ApplySplatParamsToAllLoaders();
         }
 
         if (Camera.main == null || _lodIndex == null)
@@ -390,6 +484,7 @@ public float unloadRadius = 40f;
 
                     _isLoaded[i]  = true;
                     _currentLOD[i] = desiredLOD;
+                    ApplySplatParamsToLoader(loader, desiredLOD);
 
                     if (logStreamingChanges)
                     {
@@ -407,6 +502,7 @@ public float unloadRadius = 40f;
                 if (desiredLOD != _currentLOD[i])
                 {
                     _currentLOD[i] = desiredLOD;
+                    ApplySplatParamsToLoader(loader, desiredLOD);
 
                     string lodFile = GetLODFileName(entry, desiredLOD);
                     if (!string.IsNullOrEmpty(lodFile))

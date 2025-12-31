@@ -8,7 +8,7 @@ Material:
   m_PrefabInstance: {fileID: 0}
   m_PrefabAsset: {fileID: 0}
   m_Name: GaussianPointsMat
-  m_Shader: {fileID: 4800000, guid: 25c9f14dd82c248498e50b2c6802ad0c, type: 3}
+  m_Shader: {fileID: 4800000, guid: f798601d1d27d45d58582334295e48dd, type: 3}
   m_Parent: {fileID: 0}
   m_ModifiedSerializedProperties: 0
   m_ValidKeywords: []
@@ -22,10 +22,19 @@ Material:
   m_LockedProperties: 
   m_SavedProperties:
     serializedVersion: 3
-    m_TexEnvs: []
+    m_TexEnvs:
+    - _BaseMap:
+        m_Texture: {fileID: 0}
+        m_Scale: {x: 1, y: 1}
+        m_Offset: {x: 0, y: 0}
     m_Ints: []
     m_Floats:
+    - _Alpha: 0.8
+    - _MaxPixelRadius: 96
+    - _MinPixelRadius: 1.25
     - _PointSize: 1
-    m_Colors: []
+    - _Sharpness: 10
+    m_Colors:
+    - _BaseColor: {r: 1, g: 1, b: 1, a: 1}
   m_BuildTextureStacks: []
   m_AllowLocking: 1
