@@ -31,7 +31,7 @@ LOD_INDEX_PATH = CHUNK_DIR / "navvis_chunks_lod_index.json"
 def build_lods_for_chunk(chunk_meta):
     """
     输入：一个来自 navvis_chunks_index.json 的 chunk meta 字典
-    输出：dict，记录每个 LOD 的 filename 与 count
+    输出：dict，记录每个 LOD 的 filename 与 count（对输入行做子采样，整行原样保留；兼容 9/12 列格式）
     """
     ijk = chunk_meta["ijk"]
     ix, iy, iz = ijk
@@ -41,10 +41,21 @@ def build_lods_for_chunk(chunk_meta):
     if not base_path.exists():
         raise FileNotFoundError(f"Chunk file not found: {base_path}")
 
-    # 加载原始 L0 数据：x y z sx sy sz r g b
+    # 加载原始 L0 数据
+    # Old format (9 cols):  x y z sx sy sz r g b
+    # New format (12 cols): x y z r g b xx xy xz yy yz zz
     arr = np.loadtxt(base_path)
     if arr.ndim == 1:
         arr = arr[None, :]   # 单行情况
+
+    # Validate expected column count. LOD sampling must preserve entire rows.
+    n_cols = arr.shape[1]
+    if n_cols not in (9, 12):
+        raise ValueError(f"Unexpected column count in {base_path}: {n_cols} (expected 9 or 12)")
+
+    # If still using old 9-col chunks, remind the user to re-run Stage B with covariance output.
+    if n_cols == 9:
+        print(f"[C1][WARN] Chunk TXT is 9 columns (legacy). For anisotropic ellipse splatting, regenerate chunks to 12 columns: {base_path.name}")
 
     n_total = arr.shape[0]
 

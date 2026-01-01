@@ -4,7 +4,7 @@ import json
 
 # ====== 配置 ======
 
-# 输入：Stage A 生成的 NPZ（positions + scales + colors ...）
+# 输入：Stage A 生成的 NPZ（positions + colors + cov6/cov0/cov1 ...）
 NPZ_PATH = Path("data/SampleBlock1_gaussians_demo.npz")
 
 # 输出：chunk txt 文件目录
@@ -27,8 +27,23 @@ def main():
 
     data = np.load(NPZ_PATH)
     P = data["positions"]   # (N,3)
-    S = data["scales"]      # (N,3)
     C = data["colors"]      # (N,3)
+
+    # New anisotropic ellipse splatting expects covariance per Gaussian.
+    # Prefer cov6 (xx,xy,xz,yy,yz,zz). Fall back to cov0/cov1 if needed.
+    if "cov6" in data:
+        cov6 = data["cov6"].astype(np.float32)  # (N,6)
+    elif "cov0" in data and "cov1" in data:
+        cov0 = data["cov0"].astype(np.float32)  # (N,4) (xx,xy,xz,yy)
+        cov1 = data["cov1"].astype(np.float32)  # (N,4) (yz,zz,0,0)
+        cov6 = np.stack([
+            cov0[:, 0], cov0[:, 1], cov0[:, 2], cov0[:, 3], cov1[:, 0], cov1[:, 1]
+        ], axis=1).astype(np.float32)
+    else:
+        raise KeyError("NPZ must contain 'cov6' or both 'cov0' and 'cov1' for anisotropic splatting.")
+
+    # Optional: keep scales if present (not used for chunk TXT anymore)
+    S = data["scales"] if "scales" in data else None
 
     N = P.shape[0]
     print(f"[B1] Loaded {N} Gaussians")
@@ -87,18 +102,19 @@ def main():
     # ===== B3: 写出每个 chunk 对应的 txt 文件 =====
     CHUNK_DIR.mkdir(parents=True, exist_ok=True)
 
-    chunk_meta = []  # 用于 B4：收集元数据
+    # 用于 B4：收集元数据，基于协方差格式
+    chunk_meta = []
 
     print("[B3] Writing chunk files to:", CHUNK_DIR)
     for (ix, iy, iz), idx_list in chunk_dict.items():
         idx_arr = np.array(idx_list, dtype=int)
 
-        P_chunk = P[idx_arr]   # (M,3)
-        S_chunk = S[idx_arr]   # (M,3)
-        C_chunk = C[idx_arr]   # (M,3)
+        P_chunk = P[idx_arr]      # (M,3)
+        C_chunk = C[idx_arr]      # (M,3)
+        cov6_chunk = cov6[idx_arr]  # (M,6)
 
-        # 这里继续沿用 Unity 当前的 9 列格式：x y z sx sy sz r g b
-        mat = np.hstack([P_chunk, S_chunk, C_chunk])
+        # New 12-column format: x y z r g b xx xy xz yy yz zz
+        mat = np.hstack([P_chunk, C_chunk, cov6_chunk])
 
         fname = f"{CHUNK_PREFIX}_{ix}_{iy}_{iz}.txt"
         fpath = CHUNK_DIR / fname

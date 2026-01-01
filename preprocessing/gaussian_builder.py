@@ -93,10 +93,12 @@ def compute_anisotropic_gaussians(points, kdtree, k_neighbors, scales_iso):
     返回：
       scales_aniso: (N,3) 每个点的 (sx, sy, sz)
       rotations:   (N,9) 每个点的 3x3 旋转矩阵（按列展平）
+      cov6:        (N,6) 每个点的局部协方差矩阵6个唯一元素 (xx, xy, xz, yy, yz, zz)
     """
     num = points.shape[0]
     scales_aniso = np.zeros((num, 3), dtype=np.float32)
     rotations = np.zeros((num, 9), dtype=np.float32)
+    cov6 = np.zeros((num, 6), dtype=np.float32)  # (xx, xy, xz, yy, yz, zz) in local/object space
 
     eigvals_all = []
 
@@ -110,6 +112,14 @@ def compute_anisotropic_gaussians(points, kdtree, k_neighbors, scales_iso):
             s_clamped = np.clip(s_iso, S_MIN, S_MAX)
             scales_aniso[i] = np.array([s_clamped, s_clamped, s_clamped], dtype=np.float32)
             rotations[i] = np.eye(3, dtype=np.float32).reshape(-1)
+
+            # Local covariance from isotropic sigma (regularized)
+            Sigma = np.eye(3, dtype=np.float32) * (s_clamped ** 2)
+            cov6[i] = np.array([
+                Sigma[0, 0], Sigma[0, 1], Sigma[0, 2],
+                Sigma[1, 1], Sigma[1, 2], Sigma[2, 2]
+            ], dtype=np.float32)
+
             continue
 
         # 邻域点坐标（排除自身）
@@ -148,6 +158,16 @@ def compute_anisotropic_gaussians(points, kdtree, k_neighbors, scales_iso):
         R = orthonormalize_rotation(R)
         rotations[i] = R.reshape(-1)
 
+        # Reconstruct a stable local covariance from the regularized anisotropic params:
+        # Sigma = R * diag(sigma^2) * R^T
+        Sigma = (R @ np.diag((sigma ** 2).astype(np.float32)) @ R.T).astype(np.float32)
+
+        # Store 6 unique elements (symmetric 3x3)
+        cov6[i] = np.array([
+            Sigma[0, 0], Sigma[0, 1], Sigma[0, 2],
+            Sigma[1, 1], Sigma[1, 2], Sigma[2, 2]
+        ], dtype=np.float32)
+
         eigvals_all.append(vals)
 
         if i > 0 and i % 10000 == 0:
@@ -164,7 +184,7 @@ def compute_anisotropic_gaussians(points, kdtree, k_neighbors, scales_iso):
         col = scales_aniso[:, axis]
         print(f"  {name}: min={col.min():.4f}, max={col.max():.4f}, mean={col.mean():.4f}")
 
-    return scales_aniso, rotations
+    return scales_aniso, rotations, cov6
 
 
 def main():
@@ -205,10 +225,15 @@ def main():
     scales_iso = compute_isotropic_scales(points, kdtree, K_NEIGHBORS_ISO)
 
     # A3: 各向异性 Gaussian（协方差 + PCA）
-    scales_aniso, rotations = compute_anisotropic_gaussians(
+    scales_aniso, rotations, cov6 = compute_anisotropic_gaussians(
         points, kdtree, K_NEIGHBORS_ANISO, scales_iso
     )
     print("[INFO] Anisotropic Gaussian estimation done.")
+
+    print("[INFO] Covariance diag stats (meters^2):")
+    print(f"  xx: min={cov6[:,0].min():.6e}, max={cov6[:,0].max():.6e}")
+    print(f"  yy: min={cov6[:,3].min():.6e}, max={cov6[:,3].max():.6e}")
+    print(f"  zz: min={cov6[:,5].min():.6e}, max={cov6[:,5].max():.6e}")
 
     # A4: 基础数值检查
     opacity = np.ones((points.shape[0],), dtype=np.float32)
@@ -222,6 +247,18 @@ def main():
               f"G[{colors[:,1].min():.2f}, {colors[:,1].max():.2f}], "
               f"B[{colors[:,2].min():.2f}, {colors[:,2].max():.2f}]")
 
+    # Unity shader expects covariance packed into two float4 buffers:
+    # cov0 = (xx, xy, xz, yy)
+    # cov1 = (yz, zz, 0, 0)
+    cov0 = np.zeros((points.shape[0], 4), dtype=np.float32)
+    cov1 = np.zeros((points.shape[0], 4), dtype=np.float32)
+    cov0[:, 0] = cov6[:, 0]  # xx
+    cov0[:, 1] = cov6[:, 1]  # xy
+    cov0[:, 2] = cov6[:, 2]  # xz
+    cov0[:, 3] = cov6[:, 3]  # yy
+    cov1[:, 0] = cov6[:, 4]  # yz
+    cov1[:, 1] = cov6[:, 5]  # zz
+
     # 保存 npz（研究主数据）
     OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
     np.savez(
@@ -230,12 +267,16 @@ def main():
         scales=scales_aniso.astype(np.float32),    # ★ 各向异性 σx,σy,σz
         scales_iso=scales_iso.astype(np.float32),  # ★ 方便后续对比 / fallback
         rotations=rotations.astype(np.float32),    # ★ 正交化后的 R (列展平)
+        cov6=cov6.astype(np.float32),
+        cov0=cov0,
+        cov1=cov1,
         colors=colors.astype(np.float32),
         opacity=opacity.astype(np.float32),
     )
     print(f"[INFO] Saved Gaussians to: {OUTPUT_PATH}")
 
-    # Unity 简易版 TXT 输出：仍然用各向同性尺度，兼容当前 Unity demo
+    # Unity TXT 输出（与新的 anisotropic ellipse splatting shader 对齐）
+    # Format per line: x y z r g b xx xy xz yy yz zz
     txt_path = OUTPUT_PATH.with_suffix(".txt")
     print(f"[INFO] Also writing simple text format to: {txt_path}")
 
@@ -245,11 +286,11 @@ def main():
     else:
         colors_txt = colors
 
-    # x y z sx sy sz r g b，其中 sx=sy=sz=各向同性尺度
+    # x y z r g b xx xy xz yy yz zz
     data_mat = np.hstack([
-        points,
-        np.repeat(scales_iso[:, None], 3, axis=1),
-        colors_txt
+        points.astype(np.float32),
+        colors_txt.astype(np.float32),
+        cov6.astype(np.float32)
     ])
     np.savetxt(txt_path, data_mat, fmt="%.6f")
 
