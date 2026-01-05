@@ -72,3 +72,9 @@ __pycache__/
 *.txt
 StreamingAssets/navvis_chunks_Block1/*
 !StreamingAssets/navvis_chunks_Block1/README.md
+
+# macOS
+.DS_Store
+
+# Unity recovery / autosave
+vr-renderer/Assets/_Recovery/
