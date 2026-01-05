@@ -271,6 +271,9 @@ MonoBehaviour:
   m_EditorClassIdentifier: Assembly-CSharp::FreeFlyCamera
   moveSpeed: 10
   lookSpeed: 3
+  pitchMin: -89
+  pitchMax: 89
+  lockCursorOnRightMouse: 1
 --- !u!1 &410087039
 GameObject:
   m_ObjectHideFlags: 0
@@ -445,7 +448,18 @@ MonoBehaviour:
   chunksFolderName: navvis_chunks_Block1
   lodIndexFileName: navvis_chunks_lod_index.json
   pointMaterial: {fileID: 2100000, guid: 4d676345d90bb4428b4d58585f78ae1a, type: 2}
-  pointSize: 5
+  renderAsSplatQuads: 1
+  pointSizeL0: 2
+  pointSizeL1: 3.5
+  pointSizeL2: 6
+  opacityL0: 0.25
+  opacityL1: 0.18
+  opacityL2: 0.12
+  sigmaCutoffL0: 3
+  sigmaCutoffL1: 3
+  sigmaCutoffL2: 3
+  minAxisPixels: 0.75
+  maxAxisPixels: 6
   lod0To1: 8
   lod1To2: 15
   loadRadius: 30
@@ -535,9 +549,27 @@ MonoBehaviour:
   m_EditorClassIdentifier: Assembly-CSharp::GaussianLoader
   dataFileName: SampleBlock1_gaussians_demo.txt
   pointMaterial: {fileID: 2100000, guid: 4d676345d90bb4428b4d58585f78ae1a, type: 2}
+  useSharedMaterialAsset: 1
+  overrideBasicShaderParams: 1
+  overrideOITShaderParams: 0
+  renderAsSplatQuads: 1
+  opacity: 0.7
+  sigmaCutoff: 3
+  minAxisPixels: 0.75
+  maxAxisPixels: 64
   pointSize: 1
+  oitWeightExponent: 2
+  depthWeight: 1
+  depthExponent: 2
+  nearCompRefZ: 6
+  nearCompStrength: 0
+  nearCompMin: 1
+  nearCompMax: 8
   treatInputAsWorldSpace: 1
   chunkCenterWorld: {x: -64.45, y: 133.7, z: 10.85}
+  preferOIT: 1
+  renderInSceneView: 1
+  verboseDebug: 0
 --- !u!4 &847526911
 Transform:
   m_ObjectHideFlags: 0
