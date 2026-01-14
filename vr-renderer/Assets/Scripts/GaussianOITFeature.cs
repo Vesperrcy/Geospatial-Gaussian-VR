@@ -12,6 +12,11 @@ public class GaussianOITFeature : ScriptableRendererFeature
     // RenderGraph path uses RasterCommandBuffer (Unity 6.2)
     public static event Action<RasterCommandBuffer, Camera> OnDrawGaussiansRG;
 
+    // Depth prepass: draw Gaussians into camera depth (self-depth for depth-aware blending)
+    public static event Action<CommandBuffer, Camera> OnDrawGaussiansDepth;
+    // RenderGraph path uses RasterCommandBuffer (Unity 6.2)
+    public static event Action<RasterCommandBuffer, Camera> OnDrawGaussiansDepthRG;
+
     public enum DebugView { Final, AccumColor, AccumWeight }
 
     [Serializable]
@@ -48,6 +53,7 @@ public class GaussianOITFeature : ScriptableRendererFeature
     internal TextureHandle _rgAccumWeight;
     internal bool _rgValid;
 
+    private DepthPrePass _depthPass;
     private AccumulatePass _accumPass;
     private ResolvePass _resolvePass;
 
@@ -61,9 +67,12 @@ public class GaussianOITFeature : ScriptableRendererFeature
         if (resolveShader != null)
             _resolveMat = CoreUtils.CreateEngineMaterial(resolveShader);
 
+        _depthPass  = new DepthPrePass(this, settings);
         _accumPass  = new AccumulatePass(this, settings);
         _resolvePass = new ResolvePass(this, settings);
 
+        // Depth prepass should happen before accumulate so SampleSceneDepth becomes meaningful
+        _depthPass.renderPassEvent  = settings.accumulateEvent;
         _accumPass.renderPassEvent  = settings.accumulateEvent;
         _resolvePass.renderPassEvent = settings.resolveEvent;
 
@@ -91,8 +100,79 @@ public class GaussianOITFeature : ScriptableRendererFeature
         if (_resolveMat != null)
             _resolveMat.SetInt(_DebugModeID, (int)settings.debugView);
 
+        renderer.EnqueuePass(_depthPass);
         renderer.EnqueuePass(_accumPass);
         renderer.EnqueuePass(_resolvePass);
+    }
+
+    // ---------------- Pass 0: Depth Prepass ----------------
+    class DepthPrePass : ScriptableRenderPass
+    {
+        private readonly GaussianOITFeature _feature;
+        private readonly Settings _s;
+        private static readonly ProfilingSampler _ps = new ProfilingSampler("Gaussian OIT DepthPrePass");
+
+        public DepthPrePass(GaussianOITFeature feature, Settings s)
+        {
+            _feature = feature;
+            _s = s;
+        }
+
+        public override void RecordRenderGraph(RenderGraph renderGraph, ContextContainer frameData)
+        {
+            var cameraData = frameData.Get<UniversalCameraData>();
+            var resourceData = frameData.Get<UniversalResourceData>();
+
+            using var builder = renderGraph.AddRasterRenderPass<PassData>("Gaussian OIT DepthPrePass", out var passData, _ps);
+            passData.camera = cameraData.camera;
+
+            // Write to active depth (self-depth). Do NOT touch color.
+            builder.SetRenderAttachmentDepth(resourceData.activeDepthTexture, AccessFlags.Write);
+
+            builder.AllowPassCulling(false);
+
+            builder.SetRenderFunc((PassData data, RasterGraphContext ctx) =>
+            {
+                // Ensure depth starts as far for this pass when there are no opaques.
+                // If there ARE opaques, this clear would wipe them; so only clear for camera types where
+                // we assume Gaussian-only scenes. For now: clear always (simple, predictable).
+                ctx.cmd.ClearRenderTarget(true, false, Color.clear);
+
+                OnDrawGaussiansDepthRG?.Invoke(ctx.cmd, data.camera);
+            });
+        }
+
+        private class PassData
+        {
+            public Camera camera;
+        }
+
+#pragma warning disable CS0672
+        public override void Execute(ScriptableRenderContext context, ref RenderingData renderingData)
+        {
+            var cam = renderingData.cameraData.camera;
+            var cmd = CommandBufferPool.Get("GaussianOIT_DepthPrePass");
+
+            using (new ProfilingScope(cmd, _ps))
+            {
+#pragma warning disable CS0618
+                var depthHandle = renderingData.cameraData.renderer.cameraDepthTargetHandle;
+#pragma warning restore CS0618
+
+                // Bind depth only
+                CoreUtils.SetRenderTarget(cmd, depthHandle, ClearFlag.Depth);
+
+                // Clear depth so SampleSceneDepth isn't just "far" garbage when no opaque exists.
+                // (This makes self-depth deterministic in Gaussian-only scenes.)
+                cmd.ClearRenderTarget(true, false, Color.clear);
+
+                OnDrawGaussiansDepth?.Invoke(cmd, cam);
+            }
+
+            context.ExecuteCommandBuffer(cmd);
+            CommandBufferPool.Release(cmd);
+        }
+#pragma warning restore CS0672
     }
 
     // ---------------- Pass A: Accumulate ----------------

@@ -30,10 +30,25 @@ Material:
     m_Ints: []
     m_Floats:
     - _Alpha: 0.8
+    - _DebugDepthAware: 0
+    - _DepthAwareBias: 0.02
+    - _DepthAwareScale: 15
+    - _DepthAwareStrength: 8
+    - _DepthExponent: 2
+    - _DepthWeight: 0.35
+    - _MaxAxisPixels: 64
     - _MaxPixelRadius: 96
+    - _MinAxisPixels: 0.25
     - _MinPixelRadius: 1.25
+    - _NearCompMax: 3
+    - _NearCompMin: 1
+    - _NearCompRefZ: 6
+    - _NearCompStrength: 1
+    - _Opacity: 0.7
     - _PointSize: 1
     - _Sharpness: 10
+    - _SigmaCutoff: 3
+    - _WeightExponent: 1
     m_Colors:
     - _BaseColor: {r: 1, g: 1, b: 1, a: 1}
   m_BuildTextureStacks: []

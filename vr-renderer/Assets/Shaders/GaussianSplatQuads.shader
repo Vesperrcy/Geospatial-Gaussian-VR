@@ -17,6 +17,10 @@ Shader "Unlit/GaussianSplatQuads"
         _NearCompStrength ("Near Comp Strength", Range(0,4)) = 1.0
         _NearCompMin ("Near Comp Min", Range(1,8)) = 1.0
         _NearCompMax ("Near Comp Max", Range(1,8)) = 3.0
+
+        _DepthAwareScale ("Depth-aware Scale (1/m)", Float) = 20.0
+        _DepthAwareBias ("Depth-aware Bias (m)", Float) = 0.03
+        _DepthAwareStrength ("Depth-aware Strength", Range(0,8)) = 6.0
     }
 
     SubShader
@@ -42,6 +46,7 @@ Shader "Unlit/GaussianSplatQuads"
             #pragma fragment frag
 
             #include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/Core.hlsl"
+            #include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/DeclareDepthTexture.hlsl"
 
             StructuredBuffer<float3> _Positions;
             StructuredBuffer<float3> _Colors;
@@ -68,6 +73,10 @@ Shader "Unlit/GaussianSplatQuads"
                 float _NearCompStrength;
                 float _NearCompMin;
                 float _NearCompMax;
+
+                float _DepthAwareScale;
+                float _DepthAwareBias;
+                float _DepthAwareStrength;
             CBUFFER_END
 
             struct Attributes { uint vertexID : SV_VertexID; };
@@ -93,7 +102,7 @@ Shader "Unlit/GaussianSplatQuads"
 
             Varyings vert(Attributes v)
             {
-                Varyings o;
+                Varyings o = (Varyings)0;
 
                 uint pointIndex = v.vertexID / 6;
                 uint corner     = v.vertexID - pointIndex * 6;
@@ -219,6 +228,26 @@ Shader "Unlit/GaussianSplatQuads"
 
                 float q = (i.k * i.k) * r2;
                 float alpha = exp(-0.5 * q) * _Opacity;
+
+                // Depth-aware blending against the scene depth (opaque depth buffer)
+                // If this splat is behind the nearest opaque surface at this pixel, fade it out.
+                float2 screenUV = GetNormalizedScreenSpaceUV(i.positionCS);
+                float rawSceneDepth = SampleSceneDepth(screenUV);
+
+                // When there is no valid depth (e.g., skybox), raw depth is ~1.
+                // In that case we skip fading so we don't incorrectly darken everything.
+                if (rawSceneDepth < 0.999999)
+                {
+                    float sceneEyeZ = LinearEyeDepth(rawSceneDepth, _ZBufferParams);
+                    float dz = i.viewZ - sceneEyeZ; // >0 means splat behind opaque geometry
+
+                    float x = max(dz - _DepthAwareBias, 0.0);
+                    float fade = exp(-_DepthAwareScale * x);
+
+                    // Strength: 0 = off, 8 = strong. We apply as a power for smoother control.
+                    float s = saturate(_DepthAwareStrength / 8.0);
+                    alpha *= lerp(1.0, pow(fade, 4.0), s);
+                }
 
                 float depthW = 1.0 / (1.0 + _DepthWeight * pow(max(i.viewZ, 1e-3), _DepthExponent));
                 float w = pow(saturate(alpha), _WeightExponent) * depthW;

@@ -78,3 +78,11 @@ StreamingAssets/navvis_chunks_Block1/*
 
 # Unity recovery / autosave
 vr-renderer/Assets/_Recovery/
+
+# Unity recordings / captures
+vr-renderer/Recordings/
+
+# Generated StreamingAssets
+vr-renderer/Assets/StreamingAssets/*.txt
+vr-renderer/Assets/StreamingAssets/navvis_chunks_*/
+

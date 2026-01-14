@@ -19,6 +19,7 @@ MonoBehaviour:
     resolveEvent: 500
     debugView: 0
     logOnce: 0
+  resolveShader: {fileID: 4800000, guid: 66935f70b671147359add8adc020492f, type: 3}
 --- !u!114 &11400000
 MonoBehaviour:
   m_ObjectHideFlags: 0

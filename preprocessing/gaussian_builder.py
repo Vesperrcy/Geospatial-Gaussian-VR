@@ -4,14 +4,14 @@ from pathlib import Path
 
 # ==== 配置 ====
 
-# CloudCompare 导出的、已经居中/清洗过的点云
-INPUT_PATH = Path("data/SampleBlock1.ply")
+# CloudCompare 点云
+INPUT_PATH = Path("data/TumTLS_v1.ply")
 
 # 输出的 Gaussian 参数（给以后研究用）
-OUTPUT_PATH = Path("data/SampleBlock1_gaussians_demo.npz")
+OUTPUT_PATH = Path("data/TumTLS_v1_gaussians_demo.npz")
 
 # 用于 demo 的最大高斯数量
-MAX_GAUSSIANS = 424913
+MAX_GAUSSIANS = -1
 
 # 用于估计各向同性尺度的邻域大小
 K_NEIGHBORS_ISO = 8
@@ -199,8 +199,12 @@ def main():
     print(f"[INFO] Loaded {points.shape[0]} points")
 
     # A1.5: 随机子采样一部分点用于 demo / 开发
+    # MAX_GAUSSIANS <= 0 means: use all points
     num_points = points.shape[0]
-    if num_points > MAX_GAUSSIANS:
+
+    if MAX_GAUSSIANS is None or MAX_GAUSSIANS <= 0:
+        print(f"[INFO] Using all {num_points} points (MAX_GAUSSIANS={MAX_GAUSSIANS})")
+    elif num_points > MAX_GAUSSIANS:
         idx = np.random.choice(num_points, MAX_GAUSSIANS, replace=False)
         points = points[idx]
         colors = colors[idx] if colors.size > 0 else colors

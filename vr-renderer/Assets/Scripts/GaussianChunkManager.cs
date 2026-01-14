@@ -4,22 +4,23 @@ using System.IO;
 using UnityEngine;
 
 /// <summary>
-/// 从 StreamingAssets/{chunksFolderName}/{lodIndexFileName} 读取 chunk + LOD 信息，
-/// 为每个 chunk 创建一个带 GaussianLoader 的 GameObject（默认加载 L0）。
-/// 支持：
-/// - Frustum Culling（视锥裁剪）
-/// - 距离 LOD 切换（L0/L1/L2）
-/// - Chunk Streaming（load/unload 半径滞回）
+/// Reads chunk and LOD information from StreamingAssets/{chunksFolderName}/{lodIndexFileName},
+/// and creates a GameObject with a GaussianLoader for each chunk (L0 is loaded by default).
+/// Supports:
+/// - Frustum culling
+/// - Distance-based LOD switching (L0 / L1 / L2)
+/// - Chunk streaming (load/unload radius with hysteresis)
 ///
-/// 适配新版 GaussianLoader + 椭圆 Gaussian splatting：
+/// Adapted for the new GaussianLoader and elliptical Gaussian splatting:
 /// - loader.opacity / loader.sigmaCutoff / loader.minAxisPixels / loader.maxAxisPixels
-/// - cov0/cov1 buffers 由 loader 内部创建并绑定
+/// - cov0 / cov1 buffers are created and bound internally by the loader
 /// </summary>
+
 public class GaussianChunkManager : MonoBehaviour
 {
     [Header("Chunk Folder (in StreamingAssets)")]
     // 对应 vr-renderer/Assets/StreamingAssets/navvis_chunks_Block1
-    public string chunksFolderName = "navvis_chunks_Block1";
+    public string chunksFolderName = "navvis_chunks_TUMv1";
 
     [Header("LOD index file name")]
     public string lodIndexFileName = "navvis_chunks_lod_index.json";
@@ -30,8 +31,7 @@ public class GaussianChunkManager : MonoBehaviour
     [Header("Splatting / Rendering Mode")]
     public bool renderAsSplatQuads = true;
 
-    // pointSize 目前对椭圆 shader 不起作用（shader 不用 _PointSize），但保留：
-    // 1) 你切回点模式时可用；2) 你未来可能把它作为全局缩放项写进 shader。
+  
     [Header("Point size (optional / legacy)")]
     public float pointSizeL0 = 1.0f;
     public float pointSizeL1 = 1.0f;
@@ -56,6 +56,14 @@ public class GaussianChunkManager : MonoBehaviour
     [Header("LOD distances (meters)")]
     public float lod0To1 = 5f;          // < lod0To1 使用 L0
     public float lod1To2 = 15f;         // > lod1To2 使用 L2，中间用 L1
+
+    [Header("LOD hysteresis (meters)")]
+    [Tooltip("Extra margin to avoid LOD oscillation near thresholds. Larger = more stable, but later switching.")]
+    public float lodHysteresis = 0.75f;
+
+    [Header("Per-frame reload budget")]
+    [Tooltip("Limits how many chunks may call ReloadData() per frame to avoid VR hitching.")]
+    public int maxReloadsPerFrame = 1;
 
     [Header("Streaming (chunk load/unload)")]
     [Tooltip("Ensure chunks closer than this distance are loaded (LoadData).")]
@@ -128,6 +136,9 @@ public class GaussianChunkManager : MonoBehaviour
 
     // 每个 chunk 当前使用的 LOD 层级（0=L0, 1=L1, 2=L2）
     private readonly List<int> _currentLOD = new();
+
+    // Pending LOD request per chunk (-1 = none). Used when reload budget defers a LOD switch/load.
+    private readonly List<int> _pendingLOD = new();
 
     // 记录每个 chunk 当前是否已加载 GPU 数据（用于 Streaming）
     private readonly List<bool> _isLoaded = new();
@@ -284,6 +295,15 @@ public class GaussianChunkManager : MonoBehaviour
         }
 
         Debug.Log($"[GaussianChunkManager] Loaded LOD index, chunks={_lodIndex.chunks.Count}");
+        
+        if (_lodIndex.chunks != null && _lodIndex.chunks.Count > 0)
+        {
+            var e = _lodIndex.chunks[0];
+            if (e.center != null && e.center.Length >= 3)
+                Debug.Log($"[LODIndex] first chunk center = ({e.center[0]}, {e.center[1]}, {e.center[2]})");
+            if (_lodIndex.origin != null && _lodIndex.origin.Length >= 3)
+                Debug.Log($"[LODIndex] origin = ({_lodIndex.origin[0]}, {_lodIndex.origin[1]}, {_lodIndex.origin[2]})");
+        }
     }
 
     /// <summary>
@@ -313,6 +333,7 @@ public class GaussianChunkManager : MonoBehaviour
         _chunkEntries.Clear();
         _chunkVisibility.Clear();
         _currentLOD.Clear();
+        _pendingLOD.Clear();
         _isLoaded.Clear();
 
         // 创建新的 root
@@ -370,6 +391,7 @@ public class GaussianChunkManager : MonoBehaviour
             _chunkEntries.Add(entry);
             _chunkVisibility.Add(true);
             _currentLOD.Add(0);    // 初始使用 L0
+            _pendingLOD.Add(-1);
             _isLoaded.Add(true);   // loader.Start() 会加载数据
 
             created++;
@@ -409,6 +431,54 @@ public class GaussianChunkManager : MonoBehaviour
         return entry.filename;
     }
 
+    /// <summary>
+    /// Distance from a point to an axis-aligned bounding box (AABB).
+    /// Returns 0 if the point is inside the box.
+    /// </summary>
+    private static float DistancePointToAABB(Vector3 p, Vector3 bmin, Vector3 bmax)
+    {
+        float dx = 0f;
+        if (p.x < bmin.x) dx = bmin.x - p.x;
+        else if (p.x > bmax.x) dx = p.x - bmax.x;
+
+        float dy = 0f;
+        if (p.y < bmin.y) dy = bmin.y - p.y;
+        else if (p.y > bmax.y) dy = p.y - bmax.y;
+
+        float dz = 0f;
+        if (p.z < bmin.z) dz = bmin.z - p.z;
+        else if (p.z > bmax.z) dz = p.z - bmax.z;
+
+        return Mathf.Sqrt(dx * dx + dy * dy + dz * dz);
+    }
+
+    /// <summary>
+    /// Choose a stable LOD using hysteresis around the distance thresholds.
+    /// </summary>
+    private int ChooseLODWithHysteresis(float distForLOD, int currentLod)
+    {
+        float h = Mathf.Max(0f, lodHysteresis);
+
+        // From L0 -> L1, and L1 -> L0
+        if (currentLod == 0)
+        {
+            if (distForLOD > (lod0To1 + h)) return 1;
+            return 0;
+        }
+
+        // From L2 -> L1, and L1 -> L2
+        if (currentLod == 2)
+        {
+            if (distForLOD < (lod1To2 - h)) return 1;
+            return 2;
+        }
+
+        // currentLod == 1
+        if (distForLOD < (lod0To1 - h)) return 0;
+        if (distForLOD > (lod1To2 + h)) return 2;
+        return 1;
+    }
+
     private void Update()
     {
         // 1) Sync params only when Inspector values change
@@ -419,6 +489,9 @@ public class GaussianChunkManager : MonoBehaviour
 
         if (Camera.main == null || _lodIndex == null)
             return;
+
+        // 1.5) Per-frame Reload budget (avoid VR hitch spikes)
+        int reloadsThisFrame = 0;
 
         // 2) 计算视锥体平面
         GeometryUtility.CalculateFrustumPlanes(Camera.main, _frustumPlanes);
@@ -457,48 +530,63 @@ public class GaussianChunkManager : MonoBehaviour
             else
                 center = (bmin + bmax) * 0.5f;
 
-            float dist = Vector3.Distance(camPos, center);
+            // Distance to chunk for LOD (stable): use center distance
+            float distCenter = Vector3.Distance(camPos, center);
+
+            // Distance to chunk for streaming (robust near borders): use camera-to-AABB distance
+            float distAabb = DistancePointToAABB(camPos, bmin, bmax);
 
             // --- Streaming hysteresis guard ---
             if (unloadRadius < loadRadius)
                 unloadRadius = loadRadius + 1f;
 
-            bool shouldLoad = dist < loadRadius;
-            bool shouldUnload = dist > unloadRadius;
+            bool shouldLoad = distAabb < loadRadius;
+            bool shouldUnload = distAabb > unloadRadius;
 
             if (_isLoaded[i] && shouldUnload)
             {
                 loader.UnloadData();
                 _isLoaded[i] = false;
+                if (i < _pendingLOD.Count) _pendingLOD[i] = -1;
                 loader.enabled = false;
 
                 if (logStreamingChanges)
-                    Debug.Log($"[Streaming] Unload {loader.gameObject.name} (dist={dist:F1}m)");
+                    Debug.Log($"[Streaming] Unload {loader.gameObject.name} (aabb={distAabb:F1}m, center={distCenter:F1}m)");
 
                 // 已卸载则不再做 LOD 切换
                 continue;
             }
 
-            // desired LOD
-            int desiredLOD = 0;
-            if (dist > lod1To2) desiredLOD = 2;
-            else if (dist > lod0To1) desiredLOD = 1;
+            int current = (i < _currentLOD.Count) ? _currentLOD[i] : 0;
+            int desiredLOD = ChooseLODWithHysteresis(distCenter, current);
 
-            // If not loaded and should load -> load desired LOD
+            // If not loaded and should load -> load desired LOD (or pending if any)
             if (!_isLoaded[i] && shouldLoad)
             {
-                string lodFileToLoad = GetLODFileName(entry, desiredLOD);
+                int targetLOD = (i < _pendingLOD.Count && _pendingLOD[i] >= 0) ? _pendingLOD[i] : desiredLOD;
+
+                if (reloadsThisFrame >= Mathf.Max(0, maxReloadsPerFrame))
+                {
+                    // Defer loading to a later frame to avoid hitch spikes.
+                    if (i < _pendingLOD.Count) _pendingLOD[i] = targetLOD;
+                    continue;
+                }
+
+                string lodFileToLoad = GetLODFileName(entry, targetLOD);
                 if (!string.IsNullOrEmpty(lodFileToLoad))
                 {
                     loader.dataFileName = Path.Combine(chunksFolderName, lodFileToLoad);
-                    ApplySplatParamsToLoader(loader, desiredLOD);
+                    ApplySplatParamsToLoader(loader, targetLOD);
 
                     loader.ReloadData();
+                    reloadsThisFrame++;
+
                     _isLoaded[i] = true;
-                    _currentLOD[i] = desiredLOD;
+                    _currentLOD[i] = targetLOD;
+                    if (i < _pendingLOD.Count) _pendingLOD[i] = -1;
 
                     if (logStreamingChanges)
-                        Debug.Log($"[Streaming] Load {loader.gameObject.name} (LOD{desiredLOD}, dist={dist:F1}m)");
+                        Debug.Log($"[Streaming] Load {loader.gameObject.name} (LOD{targetLOD}, aabb={distAabb:F1}m, center={distCenter:F1}m)");
                 }
 
                 // 刚加载完，跳过一帧避免连续 Reload
@@ -508,9 +596,46 @@ public class GaussianChunkManager : MonoBehaviour
             // If loaded -> LOD switch
             if (_isLoaded[i])
             {
-                if (desiredLOD != _currentLOD[i])
+                int prevLOD = _currentLOD[i];
+
+                // If a pending LOD exists (from a previous budget defer), try to apply it first.
+                int pending = (i < _pendingLOD.Count) ? _pendingLOD[i] : -1;
+                if (pending >= 0 && pending != prevLOD)
                 {
-                    _currentLOD[i] = desiredLOD;
+                    if (reloadsThisFrame < Mathf.Max(0, maxReloadsPerFrame))
+                    {
+                        string pendFile = GetLODFileName(entry, pending);
+                        if (!string.IsNullOrEmpty(pendFile))
+                        {
+                            loader.dataFileName = Path.Combine(chunksFolderName, pendFile);
+                            ApplySplatParamsToLoader(loader, pending);
+
+                            loader.ReloadData();
+                            reloadsThisFrame++;
+
+                            _currentLOD[i] = pending;
+                            _pendingLOD[i] = -1;
+
+                            if (logLODChanges)
+                                Debug.Log($"[LOD] {loader.gameObject.name} -> LOD{pending} (file={pendFile}, pending, center={distCenter:F1}m)");
+                        }
+                    }
+
+                    // Whether we applied it or not, skip the normal desiredLOD logic this frame.
+                    // This keeps behavior predictable under budget constraints.
+                    continue;
+                }
+
+                if (desiredLOD != prevLOD)
+                {
+                    // Budget check BEFORE changing any state (VR hitch protection)
+                    if (reloadsThisFrame >= Mathf.Max(0, maxReloadsPerFrame))
+                    {
+                        // Defer LOD reload to a later frame to avoid hitch spikes.
+                        // Record a pending request so we can apply it later.
+                        if (i < _pendingLOD.Count) _pendingLOD[i] = desiredLOD;
+                        continue;
+                    }
 
                     string lodFile = GetLODFileName(entry, desiredLOD);
                     if (!string.IsNullOrEmpty(lodFile))
@@ -519,14 +644,19 @@ public class GaussianChunkManager : MonoBehaviour
                         ApplySplatParamsToLoader(loader, desiredLOD);
 
                         loader.ReloadData();
+                        reloadsThisFrame++;
+
+                        // Only update state AFTER the reload actually happens
+                        _currentLOD[i] = desiredLOD;
+                        if (i < _pendingLOD.Count) _pendingLOD[i] = -1;
 
                         if (logLODChanges)
-                            Debug.Log($"[LOD] {loader.gameObject.name} -> LOD{desiredLOD} (file={lodFile}, dist={dist:F1}m)");
+                            Debug.Log($"[LOD] {loader.gameObject.name} -> LOD{desiredLOD} (file={lodFile}, center={distCenter:F1}m)");
                     }
                 }
                 else
                 {
-                    // 同 LOD：仍然确保参数一致（尤其是 renderAsSplatQuads）
+                    // Same LOD: still ensure parameters stay consistent (especially renderAsSplatQuads)
                     ApplySplatParamsToLoader(loader, desiredLOD);
                 }
             }
