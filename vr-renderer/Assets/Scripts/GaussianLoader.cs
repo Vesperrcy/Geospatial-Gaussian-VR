@@ -9,7 +9,7 @@ using UnityEngine.Rendering.Universal;
 public class GaussianLoader : MonoBehaviour
 {
     [Header("Data file (relative to StreamingAssets)")]
-    public string dataFileName = "TumTLS_v1_gaussians_demo.txt";
+    public string dataFileName = "TumTLS_v2_gaussians_demo.txt";
 
     [Header("Rendering")]
     public Material pointMaterial;
@@ -38,6 +38,29 @@ public class GaussianLoader : MonoBehaviour
     [Tooltip("Clamp ellipse axis in pixel units (max).")]
     public float maxAxisPixels = 64.0f;
     public float pointSize = 1.0f;
+
+    [Header("Scale Mixture / Fade (optional)")]
+    [Tooltip("Multiply final opacity sent to shader (useful for scale-mixture gating).")]
+    public float opacityMultiplier = 1.0f;
+
+    [Tooltip("Multiply final pointSize sent to shader (useful for scale-mixture coarse footprint).")]
+    public float pointSizeMultiplier = 1.0f;
+
+    [Tooltip("If > 0, apply a camera view-space Z fade in the shader using _ViewZFadeStart/_ViewZFadeEnd.")]
+    public bool enableViewZFade = false;
+
+    [Tooltip("View-space Z where fade begins (meters). For coarse pass you typically set this to mixtureStart.")]
+    public float viewZFadeStart = 0.0f;
+
+    [Tooltip("View-space Z where fade reaches 1 (meters). For coarse pass you typically set this to mixtureEnd.")]
+    public float viewZFadeEnd = 10.0f;
+
+    [Tooltip("Fade curve exponent. 1=linear, >1 makes the fade more concentrated near the end.")]
+    [Range(0.25f, 8f)]
+    public float viewZFadeExponent = 1.0f;
+
+    [Tooltip("If true, invert the fade (1->0). Useful for fine pass when you want it to vanish in the far range.")]
+    public bool invertViewZFade = false;
 
     [Header("OIT / Density Compensation (shader params)")]
     [Range(0.1f, 8f)] public float oitWeightExponent = 2.0f;
@@ -265,37 +288,18 @@ public class GaussianLoader : MonoBehaviour
         RenderForCamera(default, cam);
     }
 
-    // --- Core rule: If we draw splat quads, we MUST bind cov buffers every draw (Metal safe) ---
-    private void EnsureCovBuffersExist(int count)
+    // Ensure covariance buffers exist. IMPORTANT: do NOT reallocate/overwrite just because
+    // buffer capacity != _numPoints. When growBuffersByPowerOfTwo is enabled, capacity > active count
+    // is expected and we must keep the uploaded covariance.
+    private void EnsureCovBuffersAllocated()
     {
-        if (count <= 0) return;
+        int cap = Mathf.Max(1, _bufferCapacity > 0 ? _bufferCapacity : _numPoints);
 
-        if (_cov0Buffer == null || _cov0Buffer.count != count)
-        {
-            _cov0Buffer?.Release();
-            _cov0Buffer = new ComputeBuffer(count, Float4Stride, ComputeBufferType.Structured);
-        }
-        if (_cov1Buffer == null || _cov1Buffer.count != count)
-        {
-            _cov1Buffer?.Release();
-            _cov1Buffer = new ComputeBuffer(count, Float4Stride, ComputeBufferType.Structured);
-        }
+        if (_cov0Buffer == null)
+            _cov0Buffer = new ComputeBuffer(cap, Float4Stride, ComputeBufferType.Structured);
 
-        // Zero is OK for “dummy cov”. But better: small isotropic so you still see something.
-        // We’ll fill only if buffer is newly created and no data has been set.
-        // (Safe to fill always; cost is minor compared to missing-buffer crash avoidance.)
-        var tmp = new Vector4[count];
-        for (int i = 0; i < count; i++)
-        {
-            tmp[i] = new Vector4(FallbackCov, 0f, 0f, FallbackCov); // xx xy xz yy
-        }
-        _cov0Buffer.SetData(tmp);
-
-        for (int i = 0; i < count; i++)
-        {
-            tmp[i] = new Vector4(0f, FallbackCov, 0f, 0f); // yz zz 0 0 (approx isotropic in z)
-        }
-        _cov1Buffer.SetData(tmp);
+        if (_cov1Buffer == null)
+            _cov1Buffer = new ComputeBuffer(cap, Float4Stride, ComputeBufferType.Structured);
     }
 
     // Some materials (e.g., Unlit/GaussianSplatQuads) always declare _Cov0/_Cov1 buffers.
@@ -316,17 +320,18 @@ public class GaussianLoader : MonoBehaviour
         mpb.Clear();
         mpb.SetMatrix("_LocalToWorld", transform.localToWorldMatrix);
 
-       
         if (overrideBasicShaderParams)
         {
-            mpb.SetFloat("_Opacity", opacity);
+            float finalOpacity = opacity * Mathf.Max(0.0f, opacityMultiplier);
+            mpb.SetFloat("_Opacity", finalOpacity);
             mpb.SetFloat("_SigmaCutoff", sigmaCutoff);
 
             // IMPORTANT:
             // In the shader, point size is applied BEFORE the min/max pixel clamp.
             // If many splats are already clamped to the same min/max, changing _PointSize may look like it does nothing.
             // To make PointSize always have a visible effect, we scale the clamp together with PointSize and keep shader _PointSize = 1.
-            if (pointSize <= 1e-4f)
+            float finalPointSize = pointSize * Mathf.Max(0.0f, pointSizeMultiplier);
+            if (finalPointSize <= 1e-4f)
             {
                 // Treat "cleared" / zero as force-minimal splats (almost points)
                 mpb.SetFloat("_PointSize", 0f);
@@ -336,8 +341,8 @@ public class GaussianLoader : MonoBehaviour
             else
             {
                 mpb.SetFloat("_PointSize", 1.0f);
-                mpb.SetFloat("_MinAxisPixels", minAxisPixels * pointSize);
-                mpb.SetFloat("_MaxAxisPixels", maxAxisPixels * pointSize);
+                mpb.SetFloat("_MinAxisPixels", minAxisPixels * finalPointSize);
+                mpb.SetFloat("_MaxAxisPixels", maxAxisPixels * finalPointSize);
             }
         }
 
@@ -353,6 +358,13 @@ public class GaussianLoader : MonoBehaviour
             mpb.SetFloat("_NearCompMax", nearCompMax);
         }
 
+        // Optional per-loader view-space Z fade (used by scale-mixture gating in shader)
+        mpb.SetFloat("_ViewZFadeEnabled", enableViewZFade ? 1.0f : 0.0f);
+        mpb.SetFloat("_ViewZFadeStart", viewZFadeStart);
+        mpb.SetFloat("_ViewZFadeEnd", viewZFadeEnd);
+        mpb.SetFloat("_ViewZFadeExponent", viewZFadeExponent);
+        mpb.SetFloat("_ViewZFadeInvert", invertViewZFade ? 1.0f : 0.0f);
+
         // Buffers always bound per draw
         mpb.SetBuffer("_Positions", _positionBuffer);
         mpb.SetBuffer("_Colors", _colorBuffer);
@@ -364,8 +376,8 @@ public class GaussianLoader : MonoBehaviour
 
         if (MaterialNeedsCovBuffers())
         {
-            if (_cov0Buffer == null || _cov1Buffer == null || _cov0Buffer.count != _numPoints || _cov1Buffer.count != _numPoints)
-                EnsureCovBuffersExist(_numPoints);
+            // Do NOT reallocate/overwrite cov buffers when capacity != _numPoints.
+            EnsureCovBuffersAllocated();
 
             mpb.SetBuffer("_Cov0", _cov0Buffer);
             mpb.SetBuffer("_Cov1", _cov1Buffer);
@@ -449,10 +461,12 @@ public class GaussianLoader : MonoBehaviour
 
             if (overrideBasicShaderParams)
             {
-                _runtimeMaterial.SetFloat("_Opacity", opacity);
+                float finalOpacity = opacity * Mathf.Max(0.0f, opacityMultiplier);
+                _runtimeMaterial.SetFloat("_Opacity", finalOpacity);
                 _runtimeMaterial.SetFloat("_SigmaCutoff", sigmaCutoff);
 
-                if (pointSize <= 1e-4f)
+                float finalPointSize = pointSize * Mathf.Max(0.0f, pointSizeMultiplier);
+                if (finalPointSize <= 1e-4f)
                 {
                     _runtimeMaterial.SetFloat("_PointSize", 0f);
                     _runtimeMaterial.SetFloat("_MinAxisPixels", 0f);
@@ -461,8 +475,8 @@ public class GaussianLoader : MonoBehaviour
                 else
                 {
                     _runtimeMaterial.SetFloat("_PointSize", 1.0f);
-                    _runtimeMaterial.SetFloat("_MinAxisPixels", minAxisPixels * pointSize);
-                    _runtimeMaterial.SetFloat("_MaxAxisPixels", maxAxisPixels * pointSize);
+                    _runtimeMaterial.SetFloat("_MinAxisPixels", minAxisPixels * finalPointSize);
+                    _runtimeMaterial.SetFloat("_MaxAxisPixels", maxAxisPixels * finalPointSize);
                 }
             }
 
@@ -478,14 +492,19 @@ public class GaussianLoader : MonoBehaviour
                 _runtimeMaterial.SetFloat("_NearCompMax", nearCompMax);
             }
 
+            // Optional per-loader view-space Z fade (used by scale-mixture gating in shader)
+            _runtimeMaterial.SetFloat("_ViewZFadeEnabled", enableViewZFade ? 1.0f : 0.0f);
+            _runtimeMaterial.SetFloat("_ViewZFadeStart", viewZFadeStart);
+            _runtimeMaterial.SetFloat("_ViewZFadeEnd", viewZFadeEnd);
+            _runtimeMaterial.SetFloat("_ViewZFadeExponent", viewZFadeExponent);
+            _runtimeMaterial.SetFloat("_ViewZFadeInvert", invertViewZFade ? 1.0f : 0.0f);
+
             _runtimeMaterial.SetBuffer("_Positions", _positionBuffer);
             _runtimeMaterial.SetBuffer("_Colors", _colorBuffer);
 
             if (MaterialNeedsCovBuffers())
             {
-                if (_cov0Buffer == null || _cov1Buffer == null || _cov0Buffer.count != _numPoints || _cov1Buffer.count != _numPoints)
-                    EnsureCovBuffersExist(_numPoints);
-
+                EnsureCovBuffersAllocated();
                 _runtimeMaterial.SetBuffer("_Cov0", _cov0Buffer);
                 _runtimeMaterial.SetBuffer("_Cov1", _cov1Buffer);
             }
@@ -517,6 +536,15 @@ public class GaussianLoader : MonoBehaviour
         _colorBuffer = null;
         _cov0Buffer = null;
         _cov1Buffer = null;
+
+        // Disambiguate Material.SetBuffer overload (ComputeBuffer vs GraphicsBuffer) when clearing.
+        if (_runtimeMaterial != null)
+        {
+            _runtimeMaterial.SetBuffer("_Positions", (ComputeBuffer)null);
+            _runtimeMaterial.SetBuffer("_Colors", (ComputeBuffer)null);
+            _runtimeMaterial.SetBuffer("_Cov0", (ComputeBuffer)null);
+            _runtimeMaterial.SetBuffer("_Cov1", (ComputeBuffer)null);
+        }
 
         _numPoints = 0;
         _bufferCapacity = 0;

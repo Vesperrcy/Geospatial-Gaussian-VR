@@ -5,10 +5,10 @@ import json
 # ====== 配置 ======
 
 # 输入：Stage A 生成的 NPZ（positions + colors + cov6/cov0/cov1 ...）
-NPZ_PATH = Path("data/TumTLS_v1_gaussians_demo.npz")
+NPZ_PATH = Path("data/TumTLS_v2_gaussians_demo_verify.npz")
 
 # 输出：chunk txt 文件目录
-CHUNK_DIR = Path("data/navvis_chunks_TUMv1")
+CHUNK_DIR = Path("data/navvis_chunks_TUMv2")
 
 # chunk 文件命名前缀
 CHUNK_PREFIX = "navvis_chunk"
