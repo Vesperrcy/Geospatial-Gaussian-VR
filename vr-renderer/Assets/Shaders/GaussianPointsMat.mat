@@ -30,24 +30,35 @@ Material:
     m_Ints: []
     m_Floats:
     - _Alpha: 0.8
+    - _CoarseAlphaCap: 0.18
+    - _CoarseNearFootprintScale: 0.35
+    - _CoarseNearKillEnd: 10
+    - _CoarseNearKillStart: 0
     - _DebugDepthAware: 0
     - _DepthAwareBias: 0.02
     - _DepthAwareScale: 15
-    - _DepthAwareStrength: 8
+    - _DepthAwareStrength: 4
     - _DepthExponent: 2
     - _DepthWeight: 0.35
     - _MaxAxisPixels: 64
     - _MaxPixelRadius: 96
     - _MinAxisPixels: 0.25
     - _MinPixelRadius: 1.25
-    - _NearCompMax: 3
+    - _NearCompMax: 4.2
     - _NearCompMin: 1
     - _NearCompRefZ: 6
-    - _NearCompStrength: 1
+    - _NearCompStrength: 1.07
     - _Opacity: 0.7
     - _PointSize: 1
     - _Sharpness: 10
     - _SigmaCutoff: 3
+    - _SurfaceMinAlpha: 0.08
+    - _SurfaceThickness: 0.1
+    - _ViewZFadeEnabled: 0
+    - _ViewZFadeEnd: 10
+    - _ViewZFadeExponent: 1
+    - _ViewZFadeInvert: 0
+    - _ViewZFadeStart: 0
     - _WeightExponent: 1
     m_Colors:
     - _BaseColor: {r: 1, g: 1, b: 1, a: 1}

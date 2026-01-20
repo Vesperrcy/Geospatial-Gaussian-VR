@@ -207,7 +207,7 @@ Transform:
   m_GameObject: {fileID: 330585543}
   serializedVersion: 2
   m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}
-  m_LocalPosition: {x: -75, y: 12, z: -114}
+  m_LocalPosition: {x: 19, y: -5, z: -32}
   m_LocalScale: {x: 1, y: 1, z: 1}
   m_ConstrainProportionsScale: 0
   m_Children: []
@@ -276,8 +276,6 @@ MonoBehaviour:
   pitchMax: 89
   lockCursorOnRightMouse: 1
   useLocalRotation: 1
-  yawAxis: 1
-  toggleYawAxisKey: 34
 --- !u!1 &410087039
 GameObject:
   m_ObjectHideFlags: 0
@@ -449,32 +447,31 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: e6b7c26929bad42f1926cde4a17b6135, type: 3}
   m_Name: 
   m_EditorClassIdentifier: Assembly-CSharp::GaussianChunkManager
-  chunksFolderName: navvis_chunks_TUMv1
+  chunksFolderName: navvis_chunks_TUMv2
   lodIndexFileName: navvis_chunks_lod_index.json
   pointMaterial: {fileID: 2100000, guid: 4d676345d90bb4428b4d58585f78ae1a, type: 2}
   renderAsSplatQuads: 1
-  pointSizeL0: 3.5
-  pointSizeL1: 8
-  pointSizeL2: 10
-  opacityL0: 0.25
-  opacityL1: 0.18
-  opacityL2: 0.12
-  sigmaCutoffL0: 3
-  sigmaCutoffL1: 3
-  sigmaCutoffL2: 3
-  minAxisPixels: 0.75
-  maxAxisPixels: 10
-  lod0To1: 13
-  lod1To2: 20
-  lodHysteresis: 0.75
-  maxReloadsPerFrame: 1
-  loadRadius: 30
-  unloadRadius: 40
+  pointSizeL0: 1
+  pointSizeL2: 2
+  opacityL0: 0.35
+  opacityL2: 0.18
+  sigmaCutoffL0: 2.5
+  sigmaCutoffL2: 2.5
+  minAxisPixels: 0.6
+  maxAxisPixels: 48
+  enableScaleMixture: 1
+  mixtureStart: 25
+  mixtureEnd: 50
+  coarsePointSizeMultiplier: 1.15
+  coarseOpacityMultiplier: 0.25
+  mixtureHysteresis: 1
+  maxReloadsPerFrame: 50
+  loadRadius: 999
+  unloadRadius: 1200
   loadOnStart: 1
   logChunkInfo: 1
-  logLODChanges: 1
-  logCullingChanges: 1
   logStreamingChanges: 1
+  logCullingChanges: 1
 --- !u!1 &832575517
 GameObject:
   m_ObjectHideFlags: 0
@@ -553,7 +550,7 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: 464e52e080ede4429b1f84257e2067e9, type: 3}
   m_Name: 
   m_EditorClassIdentifier: Assembly-CSharp::GaussianLoader
-  dataFileName: TumTLS_v1_gaussians_demo.txt
+  dataFileName: TumTLS_v2_gaussians_demo_verify.txt
   pointMaterial: {fileID: 2100000, guid: 4d676345d90bb4428b4d58585f78ae1a, type: 2}
   useSharedMaterialAsset: 1
   forceRuntimeMaterialForBuffers: 1
@@ -565,6 +562,13 @@ MonoBehaviour:
   minAxisPixels: 0.75
   maxAxisPixels: 64
   pointSize: 1
+  opacityMultiplier: 1
+  pointSizeMultiplier: 1
+  enableViewZFade: 0
+  viewZFadeStart: 0
+  viewZFadeEnd: 10
+  viewZFadeExponent: 1
+  invertViewZFade: 0
   oitWeightExponent: 2
   depthWeight: 1
   depthExponent: 2

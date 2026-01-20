@@ -5,7 +5,7 @@ from pathlib import Path
 # ===== 配置 =====
 
 # Stage B 生成的 chunk 索引和目录
-CHUNK_DIR = Path("data/navvis_chunks_TUMv1")
+CHUNK_DIR = Path("data/navvis_chunks_TUMv2")
 CHUNK_INDEX_PATH = CHUNK_DIR / "navvis_chunks_index.json"
 
 # LOD 参数
