@@ -13,35 +13,39 @@ using UnityEngine;
 ///
 /// Two-level + scale mixture mode (this version):
 /// - Fine pass uses ONLY L0 (detail)
-/// - Coarse pass uses ONLY L2 (gap filling / stability)
+/// - Coarse pass uses ONLY L1 (gap filling / stability)
 /// - Opacity is blended by distance between mixtureStart and mixtureEnd (smoothstep)
 /// - Fine/Coarse GPU data are loaded/unloaded by distance with hysteresis to save memory/bandwidth
 /// </summary>
 public class GaussianChunkManager : MonoBehaviour
 {
     [Header("Chunk Folder (in StreamingAssets)")]
-    public string chunksFolderName = "navvis_chunks_TUMv2";
+    public string chunksFolderName = "chunks_TUMv2";
 
     [Header("LOD index file name")]
-    public string lodIndexFileName = "navvis_chunks_lod_index.json";
+    public string lodIndexFileName = "chunks_lod_index.json";
 
     [Header("Rendering")]
     public Material pointMaterial;      // Passed to GaussianLoader
+
+    // Use separate material instances for Fine/Coarse so per-pass shader params don't overwrite each other
+    private Material _pointMaterialFineInstance;
+    private Material _pointMaterialCoarseInstance;
 
     [Header("Splatting / Rendering Mode")]
     public bool renderAsSplatQuads = true;
 
     [Header("Point size (optional / legacy)")]
     public float pointSizeL0 = 1.0f;
-    public float pointSizeL2 = 1.0f;
+    public float pointSizeL1 = 1.0f;
 
     [Header("Ellipse Splat Params (two-level)")]
     [Range(0f, 1f)] public float opacityL0 = 0.6f;
-    [Range(0f, 1f)] public float opacityL2 = 0.18f;
+    [Range(0f, 1f)] public float opacityL1 = 0.18f;
 
     [Tooltip("k-sigma cutoff used to size ellipse quads (typical 2~4).")]
     public float sigmaCutoffL0 = 3.0f;
-    public float sigmaCutoffL2 = 3.0f;
+    public float sigmaCutoffL1 = 3.0f;
 
     [Tooltip("Clamp ellipse axis in pixel units (min).")]
     public float minAxisPixels = 0.75f;
@@ -49,8 +53,8 @@ public class GaussianChunkManager : MonoBehaviour
     [Tooltip("Clamp ellipse axis in pixel units (max).")]
     public float maxAxisPixels = 64.0f;
 
-    [Header("Scale Mixture (dual-pass, L0 + L2)")]
-    [Tooltip("Render each chunk twice: Fine(L0) for detail, Coarse(L2) for gap filling. Blended by distance.")]
+    [Header("Scale Mixture (dual-pass, L0 + L1)")]
+    [Tooltip("Render each chunk twice: Fine(L0) for detail, Coarse(L1) for gap filling. Blended by distance.")]
     public bool enableScaleMixture = true;
 
     [Tooltip("Distance where coarse pass starts to fade in (meters).")]
@@ -62,7 +66,7 @@ public class GaussianChunkManager : MonoBehaviour
     [Tooltip("Extra pointSize multiplier for the coarse pass (fills scanline gaps).")]
     public float coarsePointSizeMultiplier = 2.5f;
 
-    [Tooltip("Opacity multiplier for the coarse pass relative to L2 opacity (avoid over-bright).")]
+    [Tooltip("Opacity multiplier for the coarse pass relative to L1 opacity (avoid over-bright).")]
     public float coarseOpacityMultiplier = 0.35f;
 
     [Header("Mixture hysteresis (meters)")]
@@ -124,7 +128,7 @@ public class GaussianChunkManager : MonoBehaviour
 
     // Fine (L0) loaders
     private readonly List<GaussianLoader> _chunkLoaders = new();
-    // Coarse (L2) loaders
+    // Coarse (L1) loaders
     private readonly List<GaussianLoader> _chunkLoadersCoarse = new();
 
     private readonly List<ChunkEntry> _chunkEntries = new();
@@ -134,13 +138,13 @@ public class GaussianChunkManager : MonoBehaviour
     // Streaming state per chunk & per pass
     private readonly List<bool> _isChunkLoaded = new();     // chunk exists (any pass loaded)
     private readonly List<bool> _isFineLoaded = new();      // L0 pass loaded
-    private readonly List<bool> _isCoarseLoaded = new();    // L2 pass loaded
+    private readonly List<bool> _isCoarseLoaded = new();    // L1 pass loaded
 
     // Cache last applied Inspector values to avoid per-frame churn
     private bool _lastRenderAsSplatQuads;
-    private float _lastPointSizeL0, _lastPointSizeL2;
-    private float _lastOpacityL0, _lastOpacityL2;
-    private float _lastSigmaL0, _lastSigmaL2;
+    private float _lastPointSizeL0, _lastPointSizeL1;
+    private float _lastOpacityL0, _lastOpacityL1;
+    private float _lastSigmaL0, _lastSigmaL1;
     private float _lastMinAxisPx, _lastMaxAxisPx;
 
     private void Start()
@@ -196,6 +200,10 @@ public class GaussianChunkManager : MonoBehaviour
             return;
         }
 
+        // Create material instances once (NOT per chunk) so Fine/Coarse can have different params safely
+        if (_pointMaterialFineInstance == null) _pointMaterialFineInstance = new Material(pointMaterial);
+        if (_pointMaterialCoarseInstance == null) _pointMaterialCoarseInstance = new Material(pointMaterial);
+
         // cleanup old root
         if (_chunkRoot != null)
             DestroyImmediate(_chunkRoot.gameObject);
@@ -224,24 +232,27 @@ public class GaussianChunkManager : MonoBehaviour
 
             // Need L0 and L1 files (coarse uses L1; L2 is too sparse)
             string l0File = GetLODFileName(entry, 0);
-            string l2File = GetLODFileName(entry, 1);
+            string l1File = GetLODFileName(entry, 1);
 
-            if (string.IsNullOrEmpty(l0File) || string.IsNullOrEmpty(l2File))
+            if (string.IsNullOrEmpty(l0File) || string.IsNullOrEmpty(l1File))
                 continue;
 
             string fullL0 = Path.Combine(chunkDir, l0File);
-            string fullL2 = Path.Combine(chunkDir, l2File);
+            string fullL1 = Path.Combine(chunkDir, l1File);
 
             if (!File.Exists(fullL0))
             {
                 Debug.LogWarning($"[GaussianChunkManager] L0 file missing: {fullL0}");
                 continue;
             }
-            if (!File.Exists(fullL2))
+            if (!File.Exists(fullL1))
             {
-                Debug.LogWarning($"[GaussianChunkManager] L1 (coarse) file missing: {fullL2}");
+                Debug.LogWarning($"[GaussianChunkManager] L1 (coarse) file missing: {fullL1}");
                 continue;
             }
+
+            if (logChunkInfo)
+                Debug.Log($"[GaussianChunkManager] {entry.filename ?? "chunk"}: L0={l0File}, L1={l1File}");
 
             string chunkName = $"Chunk_{entry.ijk[0]}_{entry.ijk[1]}_{entry.ijk[2]}";
             GameObject go = new GameObject(chunkName);
@@ -252,7 +263,7 @@ public class GaussianChunkManager : MonoBehaviour
 
             // Fine loader on parent
             var fine = go.AddComponent<GaussianLoader>();
-            fine.pointMaterial = pointMaterial;
+            fine.pointMaterial = _pointMaterialFineInstance;
             fine.treatInputAsWorldSpace = true;
             fine.renderAsSplatQuads = renderAsSplatQuads;
 
@@ -267,14 +278,14 @@ public class GaussianChunkManager : MonoBehaviour
                 goCoarse.transform.localScale = Vector3.one;
 
                 coarse = goCoarse.AddComponent<GaussianLoader>();
-                coarse.pointMaterial = pointMaterial;
+                coarse.pointMaterial = _pointMaterialCoarseInstance;
                 coarse.treatInputAsWorldSpace = true;
                 coarse.renderAsSplatQuads = renderAsSplatQuads;
             }
 
             // assign default files (we will load/unload per distance in Update)
-            fine.dataFileName = Path.Combine(chunksFolderName, l0File);
-            if (coarse != null) coarse.dataFileName = Path.Combine(chunksFolderName, l2File);
+        fine.dataFileName = Path.Combine(chunksFolderName, l0File);
+        if (coarse != null) coarse.dataFileName = Path.Combine(chunksFolderName, l1File);
 
             // apply params
             ApplyFineParams(fine);
@@ -333,9 +344,9 @@ public class GaussianChunkManager : MonoBehaviour
         loader.renderAsSplatQuads = renderAsSplatQuads;
 
         // Base params (do NOT distance-mix in C#)
-        loader.pointSize = pointSizeL2;
-        loader.opacity = opacityL2;
-        loader.sigmaCutoff = sigmaCutoffL2;
+        loader.pointSize = pointSizeL1;
+        loader.opacity = opacityL1;
+        loader.sigmaCutoff = sigmaCutoffL1;
         loader.minAxisPixels = minAxisPixels;
         loader.maxAxisPixels = maxAxisPixels;
 
@@ -356,13 +367,13 @@ public class GaussianChunkManager : MonoBehaviour
         if (_lastRenderAsSplatQuads != renderAsSplatQuads) return true;
 
         if (!Mathf.Approximately(_lastPointSizeL0, pointSizeL0) ||
-            !Mathf.Approximately(_lastPointSizeL2, pointSizeL2)) return true;
+            !Mathf.Approximately(_lastPointSizeL1, pointSizeL1)) return true;
 
         if (!Mathf.Approximately(_lastOpacityL0, opacityL0) ||
-            !Mathf.Approximately(_lastOpacityL2, opacityL2)) return true;
+            !Mathf.Approximately(_lastOpacityL1, opacityL1)) return true;
 
         if (!Mathf.Approximately(_lastSigmaL0, sigmaCutoffL0) ||
-            !Mathf.Approximately(_lastSigmaL2, sigmaCutoffL2)) return true;
+            !Mathf.Approximately(_lastSigmaL1, sigmaCutoffL1)) return true;
 
         if (!Mathf.Approximately(_lastMinAxisPx, minAxisPixels) ||
             !Mathf.Approximately(_lastMaxAxisPx, maxAxisPixels)) return true;
@@ -375,13 +386,13 @@ public class GaussianChunkManager : MonoBehaviour
         _lastRenderAsSplatQuads = renderAsSplatQuads;
 
         _lastPointSizeL0 = pointSizeL0;
-        _lastPointSizeL2 = pointSizeL2;
+        _lastPointSizeL1 = pointSizeL1;
 
         _lastOpacityL0 = opacityL0;
-        _lastOpacityL2 = opacityL2;
+        _lastOpacityL1 = opacityL1;
 
         _lastSigmaL0 = sigmaCutoffL0;
-        _lastSigmaL2 = sigmaCutoffL2;
+        _lastSigmaL1 = sigmaCutoffL1;
 
         _lastMinAxisPx = minAxisPixels;
         _lastMaxAxisPx = maxAxisPixels;

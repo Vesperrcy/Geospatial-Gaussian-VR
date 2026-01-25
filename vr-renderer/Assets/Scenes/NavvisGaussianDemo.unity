@@ -207,7 +207,7 @@ Transform:
   m_GameObject: {fileID: 330585543}
   serializedVersion: 2
   m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}
-  m_LocalPosition: {x: 19, y: -5, z: -32}
+  m_LocalPosition: {x: 0, y: 0, z: 0}
   m_LocalScale: {x: 1, y: 1, z: 1}
   m_ConstrainProportionsScale: 0
   m_Children: []
@@ -447,20 +447,20 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: e6b7c26929bad42f1926cde4a17b6135, type: 3}
   m_Name: 
   m_EditorClassIdentifier: Assembly-CSharp::GaussianChunkManager
-  chunksFolderName: navvis_chunks_TUMv2
-  lodIndexFileName: navvis_chunks_lod_index.json
+  chunksFolderName: chunks_TUMv2
+  lodIndexFileName: chunks_lod_index.json
   pointMaterial: {fileID: 2100000, guid: 4d676345d90bb4428b4d58585f78ae1a, type: 2}
   renderAsSplatQuads: 1
   pointSizeL0: 1
-  pointSizeL2: 2
-  opacityL0: 0.35
-  opacityL2: 0.18
+  pointSizeL1: 2
+  opacityL0: 1
+  opacityL1: 0.8
   sigmaCutoffL0: 2.5
-  sigmaCutoffL2: 2.5
+  sigmaCutoffL1: 3
   minAxisPixels: 0.6
   maxAxisPixels: 48
   enableScaleMixture: 1
-  mixtureStart: 25
+  mixtureStart: 10
   mixtureEnd: 50
   coarsePointSizeMultiplier: 1.15
   coarseOpacityMultiplier: 0.25

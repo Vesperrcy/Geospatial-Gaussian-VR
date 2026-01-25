@@ -5,8 +5,8 @@ from pathlib import Path
 # ===== 配置 =====
 
 # Stage B 生成的 chunk 索引和目录
-CHUNK_DIR = Path("data/navvis_chunks_TUMv2")
-CHUNK_INDEX_PATH = CHUNK_DIR / "navvis_chunks_index.json"
+CHUNK_DIR = Path("data/chunks_TUMv2")
+CHUNK_INDEX_PATH = CHUNK_DIR / "chunks_index.json"
 
 # LOD 参数
 # L0 = 原始数据，不做子采样
@@ -19,11 +19,11 @@ MIN_POINTS_PER_LEVEL = {
     2: 50,    # L2 至少保留 50 点
 }
 
-CHUNK_PREFIX = "navvis_chunk_"
+CHUNK_PREFIX = "chunk_"
 CHUNK_SUFFIX = ".txt"
 
 # 输出的 LOD 索引 JSON
-LOD_INDEX_PATH = CHUNK_DIR / "navvis_chunks_lod_index.json"
+LOD_INDEX_PATH = CHUNK_DIR / "chunks_lod_index.json"
 
 
 # ===== C1: 构建单个 chunk 的多级 LOD =====

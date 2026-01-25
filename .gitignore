@@ -86,3 +86,10 @@ vr-renderer/Recordings/
 vr-renderer/Assets/StreamingAssets/*.txt
 vr-renderer/Assets/StreamingAssets/navvis_chunks_*/
 
+
+# Generated point cloud / chunks
+.DS_Store
+vr-renderer/Assets/StreamingAssets/chunks_*/
+vr-renderer/Assets/StreamingAssets/chunks_*/**
+*.npz
+*.ply

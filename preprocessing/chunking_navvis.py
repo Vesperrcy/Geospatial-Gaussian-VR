@@ -8,10 +8,10 @@ import json
 NPZ_PATH = Path("data/TumTLS_v2_gaussians_demo_verify.npz")
 
 # 输出：chunk txt 文件目录
-CHUNK_DIR = Path("data/navvis_chunks_TUMv2")
+CHUNK_DIR = Path("data/chunks_TUMv2")
 
 # chunk 文件命名前缀
-CHUNK_PREFIX = "navvis_chunk"
+CHUNK_PREFIX = "chunk"
 
 # chunk 尺寸（单位：米），可按需要调整
 CHUNK_SIZE = np.array([10.0, 10.0, 10.0], dtype=np.float32)  # dx, dy, dz
@@ -149,7 +149,7 @@ def main():
         "chunks": chunk_meta,
     }
 
-    index_path = CHUNK_DIR / "navvis_chunks_index.json"
+    index_path = CHUNK_DIR / "chunks_index.json"
     with open(index_path, "w", encoding="utf-8") as f:
         json.dump(index, f, indent=2)
 

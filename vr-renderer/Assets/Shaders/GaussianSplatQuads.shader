@@ -4,41 +4,13 @@ Shader "Unlit/GaussianSplatQuads"
     {
         _Opacity ("Global Opacity", Range(0,1)) = 0.7
         _SigmaCutoff ("Sigma Cutoff (k)", Float) = 3.0
-        _MinAxisPixels ("Min Footprint (px)", Float) = 0.75
-        _MaxAxisPixels ("Max Footprint (px)", Float) = 64.0
-
-        _PointSize ("Point Size Multiplier", Float) = 1.0
-
-        _WeightExponent ("OIT Weight Exponent", Range(0,4)) = 1.0
-        _DepthWeight ("Depth Weight", Range(0,2)) = 0.35
-        _DepthExponent ("Depth Exponent", Range(0,4)) = 2.0
-
-        _NearCompRefZ ("Near Comp Ref Z (m)", Float) = 6.0
-        _NearCompStrength ("Near Comp Strength", Range(0,4)) = 1.0
-        _NearCompMin ("Near Comp Min", Range(1,8)) = 1.0
-        _NearCompMax ("Near Comp Max", Range(1,8)) = 3.0
-
-        _DepthAwareScale ("Depth-aware Scale (1/m)", Float) = 20.0
-        _DepthAwareBias ("Depth-aware Bias (m)", Float) = 0.03
-        _DepthAwareStrength ("Depth-aware Strength", Range(0,8)) = 0.0
+        _MinAxisPixels ("Min Footprint (px)", Float) = 1.0
+        _MaxAxisPixels ("Max Footprint (px)", Float) = 48.0
+        _DepthAwareStrength ("Depth-aware Strength", Range(0,8)) = 8.0
+        _DepthAwareBias ("Depth-aware Bias (m)", Float) = 0.02
         _SurfaceThickness ("Surface Thickness (m)", Float) = 0.08
-        _SurfaceMinAlpha  ("Surface Min Alpha", Range(0,0.5)) = 0.05
-
-        // --- per-loader view-space Z fade (set by GaussianLoader MPB) ---
-        _ViewZFadeEnabled ("ViewZ Fade Enabled", Float) = 0
-        _ViewZFadeStart   ("ViewZ Fade Start (m)", Float) = 0
-        _ViewZFadeEnd     ("ViewZ Fade End (m)", Float) = 10
-        _ViewZFadeExponent("ViewZ Fade Exponent", Float) = 1
-        _ViewZFadeInvert  ("ViewZ Fade Invert", Float) = 0
-
-        // --- coarse-only anti-fog controls (coarse = _ViewZFadeInvert < 0.5) ---
-        _CoarseNearKillStart ("Coarse Near Kill Start (m)", Float) = 0.0
-        _CoarseNearKillEnd   ("Coarse Near Kill End (m)", Float) = 10.0
-        _CoarseNearFootprintScale ("Coarse Near Footprint Scale", Range(0.05,1.0)) = 0.35
-        _CoarseAlphaCap ("Coarse Alpha Cap", Range(0,1)) = 0.18
-
-        // --- optional grazing-angle compensation (multiplies footprint only; keep small) ---
-        _GrazeBoostMax ("Grazing Boost Max", Range(1,4)) = 1.0
+        _SurfaceMinAlpha  ("Surface Min Alpha", Range(0,0.5)) = 0.5
+        _GrazeBoostMax ("Grazing Boost Max", Range(1,4)) = 3.0
     }
 
     SubShader
@@ -78,37 +50,41 @@ Shader "Unlit/GaussianSplatQuads"
                 float _SigmaCutoff;
                 float _MinAxisPixels;
                 float _MaxAxisPixels;
-
-                float _PointSize;
-
-                float _WeightExponent;
-                float _DepthWeight;
-                float _DepthExponent;
-
-                float _NearCompRefZ;
-                float _NearCompStrength;
-                float _NearCompMin;
-                float _NearCompMax;
-
-                float _DepthAwareScale;
-                float _DepthAwareBias;
                 float _DepthAwareStrength;
+                float _DepthAwareBias;
                 float _SurfaceThickness;
                 float _SurfaceMinAlpha;
-
-                float _ViewZFadeEnabled;
-                float _ViewZFadeStart;
-                float _ViewZFadeEnd;
-                float _ViewZFadeExponent;
-                float _ViewZFadeInvert;
-
-                float _CoarseNearKillStart;
-                float _CoarseNearKillEnd;
-                float _CoarseNearFootprintScale;
-                float _CoarseAlphaCap;
-
                 float _GrazeBoostMax;
             CBUFFER_END
+
+            // --- Fixed renderer constants (not exposed in Inspector) ---
+            static const float  kPointSize           = 1.0;
+
+            // OIT weighting (keep conservative / VR-stable)
+            static const float  kWeightExponent      = 2.0;
+            static const float  kDepthWeight         = 1.0;
+            static const float  kDepthExponent       = 2.0;
+
+            // Near compensation (disabled by default)
+            static const float  kNearCompRefZ        = 6.0;
+            static const float  kNearCompStrength    = 0.0;
+            static const float  kNearCompMin         = 1.0;
+            static const float  kNearCompMax         = 1.0;
+
+            // Depth-aware params
+            static const float  kDepthAwareScale     = 15.0; // kept for compatibility; not used directly in current gating
+
+            // ViewZ fade / coarse controls (disabled)
+            static const float  kViewZFadeEnabled    = 0.0;
+            static const float  kViewZFadeStart      = 0.0;
+            static const float  kViewZFadeEnd        = 10.0;
+            static const float  kViewZFadeExponent   = 1.0;
+            static const float  kViewZFadeInvert     = 1.0;
+
+            static const float  kCoarseNearKillStart = 0.0;
+            static const float  kCoarseNearKillEnd   = 10.0;
+            static const float  kCoarseNearFootScale = 1.0;
+            static const float  kCoarseAlphaCap      = 1.0;
 
             struct Attributes { uint vertexID : SV_VertexID; };
 
@@ -134,7 +110,7 @@ Shader "Unlit/GaussianSplatQuads"
             // Coarse pass is identified by invert==0 (fine uses invert==1)
             float CoarseFlag()
             {
-                return (_ViewZFadeInvert < 0.5) ? 1.0 : 0.0;
+                return 0.0;
             }
 
             float Smooth01(float z, float a, float b)
@@ -253,20 +229,11 @@ Shader "Unlit/GaussianSplatQuads"
 
                 // --- Global footprint scaling (must scale covariance, not just extent) ---
                 float zSafe = max(z, 1e-3);
-                float boost = _NearCompRefZ / zSafe;
-                boost = pow(max(boost, 1e-3), _NearCompStrength);
-                boost = clamp(boost, _NearCompMin, _NearCompMax);
+                float boost = kNearCompRefZ / zSafe;
+                boost = pow(max(boost, 1e-3), kNearCompStrength);
+                boost = clamp(boost, kNearCompMin, kNearCompMax);
 
-                float scaleMul = max(_PointSize, 1e-3) * boost * grazeBoost;
-
-                // Coarse-only near footprint suppression (prevents fog wall)
-                float isCoarse = CoarseFlag();
-                if (isCoarse > 0.5)
-                {
-                    float coarseZ = Smooth01(z, _CoarseNearKillStart, _CoarseNearKillEnd);
-                    float footprintMul = lerp(_CoarseNearFootprintScale, 1.0, coarseZ);
-                    scaleMul *= footprintMul;
-                }
+                float scaleMul = max(kPointSize, 1e-3) * boost * grazeBoost;
 
                 // Σ_px *= scaleMul^2
                 float s2 = scaleMul * scaleMul;
@@ -357,33 +324,6 @@ Shader "Unlit/GaussianSplatQuads"
                 // EWA weight
                 float alpha = exp(-0.5 * s) * _Opacity;
 
-                // View-space Z fade (per-loader gating for scale mixture)
-                if (_ViewZFadeEnabled > 0.5)
-                {
-                    float a = _ViewZFadeStart;
-                    float b = _ViewZFadeEnd;
-                    float denom = max(abs(b - a), 1e-6);
-
-                    float t = saturate((i.viewZ - a) / denom);
-                    float f = t * t * (3.0 - 2.0 * t);
-
-                    float e = max(_ViewZFadeExponent, 0.25);
-                    f = pow(max(f, 0.0), e);
-
-                    if (_ViewZFadeInvert > 0.5)
-                        f = 1.0 - f;
-
-                    alpha *= saturate(f);
-                }
-
-                // Coarse-only near suppression + alpha cap (kills fog)
-                float isCoarse = (_ViewZFadeInvert < 0.5) ? 1.0 : 0.0;
-                if (isCoarse > 0.5)
-                {
-                    float coarseZ = Smooth01(i.viewZ, _CoarseNearKillStart, _CoarseNearKillEnd);
-                    alpha *= coarseZ;
-                    alpha = min(alpha, _CoarseAlphaCap);
-                }
 
                 // Optional surface-aware depth constraint (default strength=0 -> off)
                 if (_DepthAwareStrength > 0.001)
@@ -411,8 +351,8 @@ Shader "Unlit/GaussianSplatQuads"
 
                 if (alpha < 1e-4) discard;
 
-                float depthW = 1.0 / (1.0 + _DepthWeight * pow(max(i.viewZ, 1e-3), _DepthExponent));
-                float w = pow(saturate(alpha), _WeightExponent) * depthW;
+                float depthW = 1.0 / (1.0 + kDepthWeight * pow(max(i.viewZ, 1e-3), kDepthExponent));
+                float w = pow(saturate(alpha), kWeightExponent) * depthW;
 
                 float3 premul = i.color.rgb * alpha;
                 o.accumColor  = float4(premul * w, alpha * w);
