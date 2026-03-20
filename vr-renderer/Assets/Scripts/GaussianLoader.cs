@@ -9,7 +9,7 @@ using UnityEngine.Rendering.Universal;
 public class GaussianLoader : MonoBehaviour
 {
     [Header("Data file (relative to StreamingAssets)")]
-    public string dataFileName = "TumTLS_v1_gaussians_demo.txt";
+    public string dataFileName = "TumTLS_v2_gaussians_demo.txt";
 
     [Header("Rendering")]
     public Material pointMaterial;
@@ -38,6 +38,29 @@ public class GaussianLoader : MonoBehaviour
     [Tooltip("Clamp ellipse axis in pixel units (max).")]
     public float maxAxisPixels = 64.0f;
     public float pointSize = 1.0f;
+
+    [Header("Scale Mixture / Fade (optional)")]
+    [Tooltip("Multiply final opacity sent to shader (useful for scale-mixture gating).")]
+    public float opacityMultiplier = 1.0f;
+
+    [Tooltip("Multiply final pointSize sent to shader (useful for scale-mixture coarse footprint).")]
+    public float pointSizeMultiplier = 1.0f;
+
+    [Tooltip("If > 0, apply a camera view-space Z fade in the shader using _ViewZFadeStart/_ViewZFadeEnd.")]
+    public bool enableViewZFade = false;
+
+    [Tooltip("View-space Z where fade begins (meters). For coarse pass you typically set this to mixtureStart.")]
+    public float viewZFadeStart = 0.0f;
+
+    [Tooltip("View-space Z where fade reaches 1 (meters). For coarse pass you typically set this to mixtureEnd.")]
+    public float viewZFadeEnd = 10.0f;
+
+    [Tooltip("Fade curve exponent. 1=linear, >1 makes the fade more concentrated near the end.")]
+    [Range(0.25f, 8f)]
+    public float viewZFadeExponent = 1.0f;
+
+    [Tooltip("If true, invert the fade (1->0). Useful for fine pass when you want it to vanish in the far range.")]
+    public bool invertViewZFade = false;
 
     [Header("OIT / Density Compensation (shader params)")]
     [Range(0.1f, 8f)] public float oitWeightExponent = 2.0f;
@@ -72,32 +95,24 @@ public class GaussianLoader : MonoBehaviour
 
     private ComputeBuffer _positionBuffer;
     private ComputeBuffer _colorBuffer;
-
-    // Covariance packed for shader:
-    // _Cov0 = (xx, xy, xz, yy)
-    // _Cov1 = (yz, zz, 0, 0)
     private ComputeBuffer _cov0Buffer;
     private ComputeBuffer _cov1Buffer;
 
     private int _numPoints;
-    private int _bufferCapacity = 0; // allocated element capacity for current GPU buffers
+    private int _bufferCapacity = 0;
     private Material _runtimeMaterial;
     private MaterialPropertyBlock _mpb;
-    private Material _sourceMaterialAsset; // original asset reference (for live param mirroring)
+    private Material _sourceMaterialAsset;
     private bool _mirrorAssetParams = false;
 
     private bool _srpHooked = false;
     private bool _oitHooked = false;
+    private bool _directPassHooked = false;
 
     private const int Float3Stride = sizeof(float) * 3;
     private const int Float4Stride = sizeof(float) * 4;
-
-    // A tiny isotropic covariance (meters^2). Used when file has no covariance.
     private const float FallbackCov = 0.0001f;
 
-    // -------------------------
-    // Data cache (reduces LOD switch hitches)
-    // -------------------------
     private sealed class CachedData
     {
         public Vector3[] positions;
@@ -126,18 +141,30 @@ public class GaussianLoader : MonoBehaviour
     private static string FullPathForStreamingAsset(string fileName)
         => Path.Combine(Application.streamingAssetsPath, fileName);
 
-    void Start()
+    private bool UsesTriangleQuadRendering()
+    {
+        if (renderAsSplatQuads)
+            return true;
+
+        return _runtimeMaterial != null && _runtimeMaterial.shader != null &&
+               _runtimeMaterial.shader.name == "Unlit/RawPointCloud";
+    }
+
+    private void InitializeMaterialInstance()
     {
         if (pointMaterial == null)
         {
-            Debug.LogError("[GaussianLoader] pointMaterial is not assigned!");
+            _sourceMaterialAsset = null;
+            _runtimeMaterial = null;
+            _mirrorAssetParams = false;
             return;
         }
 
         _sourceMaterialAsset = pointMaterial;
 
-        // Always prefer a per-chunk runtime material when the shader relies on per-draw ComputeBuffers.
-        // On Metal, missing or cross-bound buffers can cause draw calls to be skipped.
+        if (_runtimeMaterial != null && !ReferenceEquals(_runtimeMaterial, _sourceMaterialAsset))
+            Destroy(_runtimeMaterial);
+
         if (useSharedMaterialAsset && forceRuntimeMaterialForBuffers)
         {
             _runtimeMaterial = new Material(pointMaterial);
@@ -148,49 +175,33 @@ public class GaussianLoader : MonoBehaviour
             _runtimeMaterial = useSharedMaterialAsset ? pointMaterial : new Material(pointMaterial);
             _mirrorAssetParams = false;
         }
-
-        _mpb = new MaterialPropertyBlock();
-
-        if (treatInputAsWorldSpace)
-            transform.position = chunkCenterWorld;
-
-        LoadData();
-
-        if (verboseDebug)
-            Debug.Log($"[GaussianLoader] Start done for {dataFileName}. num={_numPoints}");
     }
 
-    private void OnValidate()
+    private void RefreshRenderHooks()
     {
-        if (pointMaterial == null) return;
-        _sourceMaterialAsset = pointMaterial;
-
-        if (useSharedMaterialAsset)
+        if (_srpHooked)
         {
-            _runtimeMaterial = pointMaterial;
+            RenderPipelineManager.endCameraRendering -= OnEndCameraRendering;
+            _srpHooked = false;
         }
-        else
+
+        if (_oitHooked)
         {
-            if (!Application.isPlaying)
-                _runtimeMaterial = null;
+            GaussianOITFeature.OnDrawGaussians -= DrawInOIT_Compat;
+            GaussianOITFeature.OnDrawGaussiansRG -= DrawInOIT_RG;
+            _oitHooked = false;
         }
-    }
 
-    private void LateUpdate()
-    {
-        // If we created a runtime clone while still wanting live Inspector control,
-        // mirror all numeric/texture properties from the asset each frame.
-        // This does NOT copy buffers; buffers are bound per-chunk.
-        if (!_mirrorAssetParams) return;
-        if (_sourceMaterialAsset == null || _runtimeMaterial == null) return;
-        if (ReferenceEquals(_runtimeMaterial, _sourceMaterialAsset)) return;
+        if (_directPassHooked)
+        {
+            GaussianOITFeature.OnDrawDirect -= DrawDirect_Compat;
+            GaussianOITFeature.OnDrawDirectRG -= DrawDirect_RG;
+            _directPassHooked = false;
+        }
 
-        _runtimeMaterial.CopyPropertiesFromMaterial(_sourceMaterialAsset);
-    }
+        if (!isActiveAndEnabled)
+            return;
 
-    private void OnEnable()
-    {
-        // Prefer rendering through the URP RendererFeature (OIT) when available.
         if (preferOIT)
         {
             try
@@ -198,23 +209,88 @@ public class GaussianLoader : MonoBehaviour
                 GaussianOITFeature.OnDrawGaussians += DrawInOIT_Compat;
                 GaussianOITFeature.OnDrawGaussiansRG += DrawInOIT_RG;
                 _oitHooked = true;
-
-                if (verboseDebug)
-                    Debug.Log($"[GaussianLoader] OIT hooks enabled for {dataFileName}");
             }
             catch
             {
                 _oitHooked = false;
             }
         }
+        else
+        {
+            try
+            {
+                GaussianOITFeature.OnDrawDirect += DrawDirect_Compat;
+                GaussianOITFeature.OnDrawDirectRG += DrawDirect_RG;
+                _directPassHooked = true;
+            }
+            catch
+            {
+                _directPassHooked = false;
+            }
+        }
 
-        // Fallback: endCameraRendering in SRP
-        if (!_oitHooked && !_srpHooked)
+        if (!_oitHooked && !_directPassHooked)
         {
             RenderPipelineManager.endCameraRendering += OnEndCameraRendering;
             _srpHooked = true;
         }
     }
+
+    public void ConfigureRendering(Material baseMaterial, bool drawAsSplatQuads, bool useOIT)
+    {
+        bool sameMaterial = ReferenceEquals(pointMaterial, baseMaterial);
+        bool sameMode = renderAsSplatQuads == drawAsSplatQuads;
+        bool sameOIT = preferOIT == useOIT;
+        if (sameMaterial && sameMode && sameOIT && _runtimeMaterial != null)
+            return;
+
+        pointMaterial = baseMaterial;
+        renderAsSplatQuads = drawAsSplatQuads;
+        preferOIT = useOIT;
+
+        InitializeMaterialInstance();
+        RefreshRenderHooks();
+    }
+
+    void Start()
+    {
+        if (pointMaterial == null)
+        {
+            Debug.LogError("[GaussianLoader] pointMaterial is not assigned!");
+            return;
+        }
+
+        InitializeMaterialInstance();
+        _mpb = new MaterialPropertyBlock();
+
+        if (treatInputAsWorldSpace)
+            transform.position = chunkCenterWorld;
+
+        LoadData();
+    }
+
+    private void OnValidate()
+    {
+        if (pointMaterial == null) return;
+        _sourceMaterialAsset = pointMaterial;
+
+        if (!Application.isPlaying)
+        {
+            _runtimeMaterial = useSharedMaterialAsset ? pointMaterial : null;
+            _mirrorAssetParams = false;
+        }
+    }
+
+    private void LateUpdate()
+    {
+        if (!_mirrorAssetParams) return;
+        if (_sourceMaterialAsset == null || _runtimeMaterial == null) return;
+        if (ReferenceEquals(_runtimeMaterial, _sourceMaterialAsset)) return;
+
+        _runtimeMaterial.CopyPropertiesFromMaterial(_sourceMaterialAsset);
+    }
+
+    private void OnEnable() => RefreshRenderHooks();
 
     private void OnDisable()
     {
@@ -230,6 +306,13 @@ public class GaussianLoader : MonoBehaviour
             GaussianOITFeature.OnDrawGaussiansRG -= DrawInOIT_RG;
             _oitHooked = false;
         }
+
+        if (_directPassHooked)
+        {
+            GaussianOITFeature.OnDrawDirect -= DrawDirect_Compat;
+            GaussianOITFeature.OnDrawDirectRG -= DrawDirect_RG;
+            _directPassHooked = false;
+        }
     }
 
     private bool ShouldRenderForCamera(Camera cam)
@@ -244,68 +327,35 @@ public class GaussianLoader : MonoBehaviour
     {
         if (!isActiveAndEnabled) return;
         if (!ShouldRenderForCamera(cam)) return;
-
-        // If OIT is enabled for this loader, OITFeature is responsible for drawing.
-        if (_oitHooked) return;
-
+        if (_oitHooked || _directPassHooked) return;
         RenderForCamera(context, cam);
     }
 
-    // Built-in pipeline fallback (usually not used in URP)
     private void OnRenderObject()
     {
         if (GraphicsSettings.currentRenderPipeline != null)
             return;
 
-        if (_oitHooked) return;
+        if (_oitHooked || _directPassHooked) return;
 
         var cam = Camera.current;
         if (!ShouldRenderForCamera(cam)) return;
-
         RenderForCamera(default, cam);
     }
 
-    // --- Core rule: If we draw splat quads, we MUST bind cov buffers every draw (Metal safe) ---
-    private void EnsureCovBuffersExist(int count)
+    private void EnsureCovBuffersAllocated()
     {
-        if (count <= 0) return;
-
-        if (_cov0Buffer == null || _cov0Buffer.count != count)
-        {
-            _cov0Buffer?.Release();
-            _cov0Buffer = new ComputeBuffer(count, Float4Stride, ComputeBufferType.Structured);
-        }
-        if (_cov1Buffer == null || _cov1Buffer.count != count)
-        {
-            _cov1Buffer?.Release();
-            _cov1Buffer = new ComputeBuffer(count, Float4Stride, ComputeBufferType.Structured);
-        }
-
-        // Zero is OK for “dummy cov”. But better: small isotropic so you still see something.
-        // We’ll fill only if buffer is newly created and no data has been set.
-        // (Safe to fill always; cost is minor compared to missing-buffer crash avoidance.)
-        var tmp = new Vector4[count];
-        for (int i = 0; i < count; i++)
-        {
-            tmp[i] = new Vector4(FallbackCov, 0f, 0f, FallbackCov); // xx xy xz yy
-        }
-        _cov0Buffer.SetData(tmp);
-
-        for (int i = 0; i < count; i++)
-        {
-            tmp[i] = new Vector4(0f, FallbackCov, 0f, 0f); // yz zz 0 0 (approx isotropic in z)
-        }
-        _cov1Buffer.SetData(tmp);
+        int cap = Mathf.Max(1, _bufferCapacity > 0 ? _bufferCapacity : _numPoints);
+        if (_cov0Buffer == null)
+            _cov0Buffer = new ComputeBuffer(cap, Float4Stride, ComputeBufferType.Structured);
+        if (_cov1Buffer == null)
+            _cov1Buffer = new ComputeBuffer(cap, Float4Stride, ComputeBufferType.Structured);
     }
 
-    // Some materials (e.g., Unlit/GaussianSplatQuads) always declare _Cov0/_Cov1 buffers.
-    // On Metal, failing to bind a declared ComputeBuffer can skip the entire draw call.
     private bool MaterialNeedsCovBuffers()
     {
         if (_runtimeMaterial == null) return false;
-        // If we are drawing splat quads, we definitely need cov buffers.
         if (renderAsSplatQuads) return true;
-        // Even in point mode, the active shader might still declare these buffers.
         return _runtimeMaterial.HasProperty("_Cov0") || _runtimeMaterial.HasProperty("_Cov1");
     }
 
@@ -316,28 +366,31 @@ public class GaussianLoader : MonoBehaviour
         mpb.Clear();
         mpb.SetMatrix("_LocalToWorld", transform.localToWorldMatrix);
 
-       
         if (overrideBasicShaderParams)
         {
-            mpb.SetFloat("_Opacity", opacity);
+            float finalOpacity = opacity * Mathf.Max(0.0f, opacityMultiplier);
+            mpb.SetFloat("_Opacity", finalOpacity);
             mpb.SetFloat("_SigmaCutoff", sigmaCutoff);
 
-            // IMPORTANT:
-            // In the shader, point size is applied BEFORE the min/max pixel clamp.
-            // If many splats are already clamped to the same min/max, changing _PointSize may look like it does nothing.
-            // To make PointSize always have a visible effect, we scale the clamp together with PointSize and keep shader _PointSize = 1.
-            if (pointSize <= 1e-4f)
+            float finalPointSize = pointSize * Mathf.Max(0.0f, pointSizeMultiplier);
+            if (!renderAsSplatQuads)
             {
-                // Treat "cleared" / zero as force-minimal splats (almost points)
-                mpb.SetFloat("_PointSize", 0f);
-                mpb.SetFloat("_MinAxisPixels", 0f);
-                mpb.SetFloat("_MaxAxisPixels", 0f);
+                mpb.SetFloat("_PointSize", Mathf.Max(0.0f, finalPointSize));
             }
             else
             {
-                mpb.SetFloat("_PointSize", 1.0f);
-                mpb.SetFloat("_MinAxisPixels", minAxisPixels * pointSize);
-                mpb.SetFloat("_MaxAxisPixels", maxAxisPixels * pointSize);
+                if (finalPointSize <= 1e-4f)
+                {
+                    mpb.SetFloat("_PointSize", 0f);
+                    mpb.SetFloat("_MinAxisPixels", 0f);
+                    mpb.SetFloat("_MaxAxisPixels", 0f);
+                }
+                else
+                {
+                    mpb.SetFloat("_PointSize", 1.0f);
+                    mpb.SetFloat("_MinAxisPixels", minAxisPixels * finalPointSize);
+                    mpb.SetFloat("_MaxAxisPixels", maxAxisPixels * finalPointSize);
+                }
             }
         }
 
@@ -346,14 +399,18 @@ public class GaussianLoader : MonoBehaviour
             mpb.SetFloat("_WeightExponent", oitWeightExponent);
             mpb.SetFloat("_DepthWeight", depthWeight);
             mpb.SetFloat("_DepthExponent", depthExponent);
-
             mpb.SetFloat("_NearCompRefZ", nearCompRefZ);
             mpb.SetFloat("_NearCompStrength", nearCompStrength);
             mpb.SetFloat("_NearCompMin", nearCompMin);
             mpb.SetFloat("_NearCompMax", nearCompMax);
         }
 
-        // Buffers always bound per draw
+        mpb.SetFloat("_ViewZFadeEnabled", enableViewZFade ? 1.0f : 0.0f);
+        mpb.SetFloat("_ViewZFadeStart", viewZFadeStart);
+        mpb.SetFloat("_ViewZFadeEnd", viewZFadeEnd);
+        mpb.SetFloat("_ViewZFadeExponent", viewZFadeExponent);
+        mpb.SetFloat("_ViewZFadeInvert", invertViewZFade ? 1.0f : 0.0f);
+
         mpb.SetBuffer("_Positions", _positionBuffer);
         mpb.SetBuffer("_Colors", _colorBuffer);
         if (!ReferenceEquals(_runtimeMaterial, _sourceMaterialAsset))
@@ -364,14 +421,10 @@ public class GaussianLoader : MonoBehaviour
 
         if (MaterialNeedsCovBuffers())
         {
-            if (_cov0Buffer == null || _cov1Buffer == null || _cov0Buffer.count != _numPoints || _cov1Buffer.count != _numPoints)
-                EnsureCovBuffersExist(_numPoints);
-
+            EnsureCovBuffersAllocated();
             mpb.SetBuffer("_Cov0", _cov0Buffer);
             mpb.SetBuffer("_Cov1", _cov1Buffer);
 
-            // Fallback for Metal / some SRP paths: also bind on the material instance.
-            // Only do this if we are NOT using the shared asset material.
             if (!ReferenceEquals(_runtimeMaterial, _sourceMaterialAsset))
             {
                 _runtimeMaterial.SetBuffer("_Positions", _positionBuffer);
@@ -382,55 +435,66 @@ public class GaussianLoader : MonoBehaviour
         }
     }
 
-    // === OIT rendering entrypoints (called by GaussianOITFeature) ===
     private void DrawInOIT_Compat(CommandBuffer cmd, Camera cam)
     {
-        if (!isActiveAndEnabled) return;
-        if (!ShouldRenderForCamera(cam)) return;
-        if (_runtimeMaterial == null) return;
-        if (_numPoints <= 0) return;
-
-        // Must have these to draw anything
+        if (!isActiveAndEnabled || !ShouldRenderForCamera(cam) || _runtimeMaterial == null || _numPoints <= 0) return;
         if (_positionBuffer == null || _colorBuffer == null) return;
-
         if (_mpb == null) _mpb = new MaterialPropertyBlock();
         BuildAndBindMPB(_mpb);
 
-        int vertexCount = renderAsSplatQuads ? (_numPoints * 6) : _numPoints;
-        MeshTopology topo = renderAsSplatQuads ? MeshTopology.Triangles : MeshTopology.Points;
-
+        bool useQuads = UsesTriangleQuadRendering();
+        int vertexCount = useQuads ? (_numPoints * 6) : _numPoints;
+        MeshTopology topo = useQuads ? MeshTopology.Triangles : MeshTopology.Points;
         cmd.DrawProcedural(Matrix4x4.identity, _runtimeMaterial, 0, topo, vertexCount, 1, _mpb);
     }
 
     private void DrawInOIT_RG(RasterCommandBuffer cmd, Camera cam)
     {
-        if (!isActiveAndEnabled) return;
-        if (!ShouldRenderForCamera(cam)) return;
-        if (_runtimeMaterial == null) return;
-        if (_numPoints <= 0) return;
-
+        if (!isActiveAndEnabled || !ShouldRenderForCamera(cam) || _runtimeMaterial == null || _numPoints <= 0) return;
         if (_positionBuffer == null || _colorBuffer == null) return;
-
         if (_mpb == null) _mpb = new MaterialPropertyBlock();
         BuildAndBindMPB(_mpb);
 
-        int vertexCount = renderAsSplatQuads ? (_numPoints * 6) : _numPoints;
-        MeshTopology topo = renderAsSplatQuads ? MeshTopology.Triangles : MeshTopology.Points;
+        bool useQuads = UsesTriangleQuadRendering();
+        int vertexCount = useQuads ? (_numPoints * 6) : _numPoints;
+        MeshTopology topo = useQuads ? MeshTopology.Triangles : MeshTopology.Points;
+        cmd.DrawProcedural(Matrix4x4.identity, _runtimeMaterial, 0, topo, vertexCount, 1, _mpb);
+    }
 
+    private void DrawDirect_Compat(CommandBuffer cmd, Camera cam)
+    {
+        if (!isActiveAndEnabled || !ShouldRenderForCamera(cam) || preferOIT || _runtimeMaterial == null || _numPoints <= 0) return;
+        if (_positionBuffer == null || _colorBuffer == null) return;
+        if (_mpb == null) _mpb = new MaterialPropertyBlock();
+        BuildAndBindMPB(_mpb);
+
+        bool useQuads = UsesTriangleQuadRendering();
+        int vertexCount = useQuads ? (_numPoints * 6) : _numPoints;
+        MeshTopology topo = useQuads ? MeshTopology.Triangles : MeshTopology.Points;
+        cmd.DrawProcedural(Matrix4x4.identity, _runtimeMaterial, 0, topo, vertexCount, 1, _mpb);
+    }
+
+    private void DrawDirect_RG(RasterCommandBuffer cmd, Camera cam)
+    {
+        if (!isActiveAndEnabled || !ShouldRenderForCamera(cam) || preferOIT || _runtimeMaterial == null || _numPoints <= 0) return;
+        if (_positionBuffer == null || _colorBuffer == null) return;
+        if (_mpb == null) _mpb = new MaterialPropertyBlock();
+        BuildAndBindMPB(_mpb);
+
+        bool useQuads = UsesTriangleQuadRendering();
+        int vertexCount = useQuads ? (_numPoints * 6) : _numPoints;
+        MeshTopology topo = useQuads ? MeshTopology.Triangles : MeshTopology.Points;
         cmd.DrawProcedural(Matrix4x4.identity, _runtimeMaterial, 0, topo, vertexCount, 1, _mpb);
     }
 
     private void RenderForCamera(ScriptableRenderContext context, Camera cam)
     {
-        if (_runtimeMaterial == null) return;
-        if (_numPoints <= 0) return;
-        if (_positionBuffer == null || _colorBuffer == null) return;
+        if (_runtimeMaterial == null || _numPoints <= 0 || _positionBuffer == null || _colorBuffer == null) return;
 
-        // In SRP, draw with a command buffer.
         bool isSRP = (GraphicsSettings.currentRenderPipeline != null);
-
-        int vertexCount = renderAsSplatQuads ? (_numPoints * 6) : _numPoints;
-        MeshTopology topo = renderAsSplatQuads ? MeshTopology.Triangles : MeshTopology.Points;
+        bool useQuads = UsesTriangleQuadRendering();
+        int vertexCount = useQuads ? (_numPoints * 6) : _numPoints;
+        MeshTopology topo = useQuads ? MeshTopology.Triangles : MeshTopology.Points;
 
         if (_mpb == null) _mpb = new MaterialPropertyBlock();
         BuildAndBindMPB(_mpb);
@@ -444,25 +508,33 @@ public class GaussianLoader : MonoBehaviour
         }
         else
         {
-            // Built-in: bind buffers directly to the material (MaterialPropertyBlock is not used by DrawProceduralNow).
             _runtimeMaterial.SetMatrix("_LocalToWorld", transform.localToWorldMatrix);
 
             if (overrideBasicShaderParams)
             {
-                _runtimeMaterial.SetFloat("_Opacity", opacity);
+                float finalOpacity = opacity * Mathf.Max(0.0f, opacityMultiplier);
+                _runtimeMaterial.SetFloat("_Opacity", finalOpacity);
                 _runtimeMaterial.SetFloat("_SigmaCutoff", sigmaCutoff);
 
-                if (pointSize <= 1e-4f)
+                float finalPointSize = pointSize * Mathf.Max(0.0f, pointSizeMultiplier);
+                if (!renderAsSplatQuads)
                 {
-                    _runtimeMaterial.SetFloat("_PointSize", 0f);
-                    _runtimeMaterial.SetFloat("_MinAxisPixels", 0f);
-                    _runtimeMaterial.SetFloat("_MaxAxisPixels", 0f);
+                    _runtimeMaterial.SetFloat("_PointSize", Mathf.Max(0.0f, finalPointSize));
                 }
                 else
                 {
-                    _runtimeMaterial.SetFloat("_PointSize", 1.0f);
-                    _runtimeMaterial.SetFloat("_MinAxisPixels", minAxisPixels * pointSize);
-                    _runtimeMaterial.SetFloat("_MaxAxisPixels", maxAxisPixels * pointSize);
+                    if (finalPointSize <= 1e-4f)
+                    {
+                        _runtimeMaterial.SetFloat("_PointSize", 0f);
+                        _runtimeMaterial.SetFloat("_MinAxisPixels", 0f);
+                        _runtimeMaterial.SetFloat("_MaxAxisPixels", 0f);
+                    }
+                    else
+                    {
+                        _runtimeMaterial.SetFloat("_PointSize", 1.0f);
+                        _runtimeMaterial.SetFloat("_MinAxisPixels", minAxisPixels * finalPointSize);
+                        _runtimeMaterial.SetFloat("_MaxAxisPixels", maxAxisPixels * finalPointSize);
+                    }
                 }
             }
 
@@ -471,21 +543,24 @@ public class GaussianLoader : MonoBehaviour
                 _runtimeMaterial.SetFloat("_WeightExponent", oitWeightExponent);
                 _runtimeMaterial.SetFloat("_DepthWeight", depthWeight);
                 _runtimeMaterial.SetFloat("_DepthExponent", depthExponent);
-
                 _runtimeMaterial.SetFloat("_NearCompRefZ", nearCompRefZ);
                 _runtimeMaterial.SetFloat("_NearCompStrength", nearCompStrength);
                 _runtimeMaterial.SetFloat("_NearCompMin", nearCompMin);
                 _runtimeMaterial.SetFloat("_NearCompMax", nearCompMax);
             }
 
+            _runtimeMaterial.SetFloat("_ViewZFadeEnabled", enableViewZFade ? 1.0f : 0.0f);
+            _runtimeMaterial.SetFloat("_ViewZFadeStart", viewZFadeStart);
+            _runtimeMaterial.SetFloat("_ViewZFadeEnd", viewZFadeEnd);
+            _runtimeMaterial.SetFloat("_ViewZFadeExponent", viewZFadeExponent);
+            _runtimeMaterial.SetFloat("_ViewZFadeInvert", invertViewZFade ? 1.0f : 0.0f);
+
             _runtimeMaterial.SetBuffer("_Positions", _positionBuffer);
             _runtimeMaterial.SetBuffer("_Colors", _colorBuffer);
 
             if (MaterialNeedsCovBuffers())
             {
-                if (_cov0Buffer == null || _cov1Buffer == null || _cov0Buffer.count != _numPoints || _cov1Buffer.count != _numPoints)
-                    EnsureCovBuffersExist(_numPoints);
-
+                EnsureCovBuffersAllocated();
                 _runtimeMaterial.SetBuffer("_Cov0", _cov0Buffer);
                 _runtimeMaterial.SetBuffer("_Cov1", _cov1Buffer);
             }
@@ -503,11 +578,6 @@ public class GaussianLoader : MonoBehaviour
 
     public void UnloadData()
     {
-        // Safety: If buffers are released, the object might still be subscribed.
-        // Disabling will stop isActiveAndEnabled from drawing via OIT callbacks.
-        // (ChunkManager may handle enabled/disabled as well; this is extra safety.)
-        // enabled = false;
-
         _positionBuffer?.Release();
         _colorBuffer?.Release();
         _cov0Buffer?.Release();
@@ -518,6 +588,14 @@ public class GaussianLoader : MonoBehaviour
         _cov0Buffer = null;
         _cov1Buffer = null;
 
+        if (_runtimeMaterial != null)
+        {
+            _runtimeMaterial.SetBuffer("_Positions", (ComputeBuffer)null);
+            _runtimeMaterial.SetBuffer("_Colors", (ComputeBuffer)null);
+            _runtimeMaterial.SetBuffer("_Cov0", (ComputeBuffer)null);
+            _runtimeMaterial.SetBuffer("_Cov1", (ComputeBuffer)null);
+        }
+
         _numPoints = 0;
         _bufferCapacity = 0;
         _mpb?.Clear();
@@ -525,13 +603,12 @@ public class GaussianLoader : MonoBehaviour
 
     private void LoadData()
     {
-        Debug.Log($"[GaussianLoader] LoadData: {dataFileName}");
-
         if (string.IsNullOrEmpty(dataFileName))
         {
             Debug.LogError("[GaussianLoader] dataFileName is empty.");
             return;
         }
+
         string path = FullPathForStreamingAsset(dataFileName);
         if (!File.Exists(path))
         {
@@ -539,14 +616,12 @@ public class GaussianLoader : MonoBehaviour
             return;
         }
 
-        // ---- 1) Try cache first (massively reduces hitching when switching LOD back/forth) ----
         CachedData cached = null;
         if (enableDataCache)
         {
             var writeUtc = File.GetLastWriteTimeUtc(path);
             if (s_DataCache.TryGetValue(path, out cached))
             {
-                // Invalidate if file changed
                 if (cached == null || cached.lastWriteUtc != writeUtc)
                 {
                     s_DataCache.Remove(path);
@@ -569,7 +644,6 @@ public class GaussianLoader : MonoBehaviour
 
         if (enableDataCache && cached != null && cached.positions != null)
         {
-            // Cache hit
             positionsArr = cached.positions;
             colorsArr = cached.colors;
             cov0Arr = cached.cov0;
@@ -578,7 +652,6 @@ public class GaussianLoader : MonoBehaviour
         }
         else
         {
-            // ---- 2) Parse file (single pass) ----
             var posList = new List<Vector3>(1024);
             var colList = new List<Vector3>(1024);
             var c0List  = new List<Vector4>(1024);
@@ -589,14 +662,13 @@ public class GaussianLoader : MonoBehaviour
                 if (string.IsNullOrWhiteSpace(line))
                     continue;
 
-                var t = line.Split((char[])null, System.StringSplitOptions.RemoveEmptyEntries);
+                var t = line.Split((char[])null, StringSplitOptions.RemoveEmptyEntries);
                 if (t.Length < 6)
                     continue;
 
                 float x = float.Parse(t[0], CultureInfo.InvariantCulture);
                 float y = float.Parse(t[1], CultureInfo.InvariantCulture);
                 float z = float.Parse(t[2], CultureInfo.InvariantCulture);
-
                 float r = float.Parse(t[3], CultureInfo.InvariantCulture);
                 float g = float.Parse(t[4], CultureInfo.InvariantCulture);
                 float b = float.Parse(t[5], CultureInfo.InvariantCulture);
@@ -634,26 +706,22 @@ public class GaussianLoader : MonoBehaviour
             }
 
             positionsArr = posList.ToArray();
-            colorsArr    = colList.ToArray();
-            cov0Arr      = c0List.ToArray();
-            cov1Arr      = c1List.ToArray();
+            colorsArr = colList.ToArray();
+            cov0Arr = c0List.ToArray();
+            cov1Arr = c1List.ToArray();
 
             if (enableDataCache && cached != null)
             {
                 cached.positions = positionsArr;
-                cached.colors    = colorsArr;
-                cached.cov0      = cov0Arr;
-                cached.cov1      = cov1Arr;
-                cached.count     = count;
+                cached.colors = colorsArr;
+                cached.cov0 = cov0Arr;
+                cached.cov1 = cov1Arr;
+                cached.count = count;
             }
         }
 
         _numPoints = count;
-
-        // ---- 3) Allocate GPU buffers with extra capacity to reduce realloc hitching ----
-        int desiredCapacity = _numPoints;
-        if (growBuffersByPowerOfTwo)
-            desiredCapacity = NextPow2(desiredCapacity);
+        int desiredCapacity = growBuffersByPowerOfTwo ? NextPow2(_numPoints) : _numPoints;
 
         bool needAlloc = (_bufferCapacity != desiredCapacity)
                          || _positionBuffer == null || _colorBuffer == null
@@ -667,24 +735,19 @@ public class GaussianLoader : MonoBehaviour
             _cov1Buffer?.Release();
 
             _bufferCapacity = desiredCapacity;
-
             _positionBuffer = new ComputeBuffer(_bufferCapacity, Float3Stride, ComputeBufferType.Structured);
             _colorBuffer    = new ComputeBuffer(_bufferCapacity, Float3Stride, ComputeBufferType.Structured);
             _cov0Buffer     = new ComputeBuffer(_bufferCapacity, Float4Stride, ComputeBufferType.Structured);
             _cov1Buffer     = new ComputeBuffer(_bufferCapacity, Float4Stride, ComputeBufferType.Structured);
         }
 
-        // Upload only the active count
         _positionBuffer.SetData(positionsArr, 0, 0, _numPoints);
         _colorBuffer.SetData(colorsArr, 0, 0, _numPoints);
         _cov0Buffer.SetData(cov0Arr, 0, 0, _numPoints);
         _cov1Buffer.SetData(cov1Arr, 0, 0, _numPoints);
 
-        Debug.Log($"[GaussianLoader] Loaded {_numPoints} points. (capacity={_bufferCapacity})");
         if (verboseDebug)
-        {
-            Debug.Log($"[GaussianLoader] Buffers: pos={(_positionBuffer!=null)} col={(_colorBuffer!=null)} cov0={(_cov0Buffer!=null)} cov1={(_cov1Buffer!=null)}");
-        }
+            Debug.Log($"[GaussianLoader] Loaded {_numPoints} points. (capacity={_bufferCapacity})");
     }
 
     private void OnDestroy()
@@ -692,11 +755,9 @@ public class GaussianLoader : MonoBehaviour
         OnDisable();
         UnloadData();
 
-        // Destroy runtime clone if we created one.
         if (_runtimeMaterial != null && !ReferenceEquals(_runtimeMaterial, _sourceMaterialAsset))
-        {
             Destroy(_runtimeMaterial);
-        }
+
         _runtimeMaterial = null;
     }
 }
