@@ -71,6 +71,15 @@ def log(msg: str):
         print(msg)
 
 # ==============================
+# PLY color attributes
+# ==============================
+USE_INTENSITY_AUX_COLOR = True
+INTENSITY_COLOR_STRENGTH = 0.25
+INTENSITY_LOW_PERCENTILE = 2.0
+INTENSITY_HIGH_PERCENTILE = 98.0
+INTENSITY_PERCENTILE_SAMPLE = 1_000_000
+
+# ==============================
 # Sampling strategy
 # ==============================
 # Refs: REF-PAPER-3DGS, REF-PAPER-H3DGS, REF-LIB-OPEN3D. See /REFERENCES.md.
@@ -931,6 +940,195 @@ def apply_frame_transform(points: np.ndarray,
     return _cpu_blocked()
 
 
+# Refs: REF-SPEC-PLY. See /REFERENCES.md.
+PLY_NUMPY_TYPES = {
+    "char": "i1",
+    "int8": "i1",
+    "uchar": "u1",
+    "uint8": "u1",
+    "short": "i2",
+    "int16": "i2",
+    "ushort": "u2",
+    "uint16": "u2",
+    "int": "i4",
+    "int32": "i4",
+    "uint": "u4",
+    "uint32": "u4",
+    "float": "f4",
+    "float32": "f4",
+    "double": "f8",
+    "float64": "f8",
+}
+
+
+def read_ply_vertex_attribute_layout(ply_path: Path) -> Optional[dict[str, object]]:
+    """Read the PLY header layout needed for direct RGB/intensity access."""
+    with open(ply_path, "rb") as f:
+        first = f.readline().decode("ascii", errors="replace").strip()
+        if first != "ply":
+            return None
+
+        fmt = ""
+        vertex_count = 0
+        in_vertex = False
+        vertex_props: list[tuple[str, str]] = []
+
+        while True:
+            raw = f.readline()
+            if not raw:
+                return None
+            line = raw.decode("ascii", errors="replace").strip()
+            if line == "end_header":
+                data_offset = f.tell()
+                break
+
+            parts = line.split()
+            if not parts:
+                continue
+
+            if parts[0] == "format" and len(parts) >= 2:
+                fmt = parts[1]
+            elif parts[0] == "element" and len(parts) >= 3:
+                in_vertex = parts[1] == "vertex"
+                if in_vertex:
+                    vertex_count = int(parts[2])
+            elif in_vertex and parts[0] == "property":
+                if len(parts) >= 5 and parts[1] == "list":
+                    log("[WARN] Direct PLY RGB/intensity read skipped because vertex list properties are unsupported.")
+                    return None
+                if len(parts) >= 3:
+                    vertex_props.append((parts[2], parts[1]))
+
+    return {
+        "format": fmt,
+        "vertex_count": vertex_count,
+        "vertex_props": vertex_props,
+        "data_offset": data_offset,
+    }
+
+
+def build_ply_vertex_dtype(vertex_props: list[tuple[str, str]], endian: str) -> Optional[np.dtype]:
+    dtype_fields = []
+    used_names: set[str] = set()
+    for name, ply_type in vertex_props:
+        type_key = ply_type.lower()
+        if type_key not in PLY_NUMPY_TYPES:
+            log(f"[WARN] Direct PLY RGB/intensity read skipped because property type is unsupported: {ply_type}")
+            return None
+        field_name = name
+        if field_name in used_names:
+            suffix = 1
+            while f"{field_name}_{suffix}" in used_names:
+                suffix += 1
+            field_name = f"{field_name}_{suffix}"
+        used_names.add(field_name)
+        dtype_fields.append((field_name, endian + PLY_NUMPY_TYPES[type_key]))
+    return np.dtype(dtype_fields)
+
+
+def normalize_rgb_channels(rgb_raw: np.ndarray) -> np.ndarray:
+    rgb = np.asarray(rgb_raw, dtype=np.float32)
+    if rgb.size == 0:
+        return rgb.reshape((-1, 3))
+    if np.nanmax(rgb) > 1.1:
+        rgb = rgb / 255.0
+    return np.clip(rgb, 0.0, 1.0).astype(np.float32, copy=False)
+
+
+def normalize_intensity_for_color(intensity: np.ndarray) -> Optional[np.ndarray]:
+    values = np.asarray(intensity, dtype=np.float32)
+    finite = values[np.isfinite(values)]
+    if finite.size == 0:
+        return None
+
+    if finite.size > INTENSITY_PERCENTILE_SAMPLE:
+        step = max(1, finite.size // INTENSITY_PERCENTILE_SAMPLE)
+        finite = finite[::step]
+
+    lo = float(np.percentile(finite, INTENSITY_LOW_PERCENTILE))
+    hi = float(np.percentile(finite, INTENSITY_HIGH_PERCENTILE))
+    if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
+        lo = float(np.min(finite))
+        hi = float(np.max(finite))
+    if hi <= lo:
+        return np.full(values.shape, 0.5, dtype=np.float32)
+
+    norm = (values - lo) / (hi - lo)
+    norm = np.nan_to_num(norm, nan=0.5, posinf=1.0, neginf=0.0)
+    return np.clip(norm, 0.0, 1.0).astype(np.float32, copy=False)
+
+
+def apply_intensity_aux_coloring(colors: np.ndarray, intensity: Optional[np.ndarray]) -> np.ndarray:
+    if not USE_INTENSITY_AUX_COLOR or intensity is None or INTENSITY_COLOR_STRENGTH <= 0.0:
+        return colors
+
+    norm = normalize_intensity_for_color(intensity)
+    if norm is None or norm.shape[0] != colors.shape[0]:
+        log("[WARN] scalar_Intensity was found but could not be aligned with RGB colors; using RGB only.")
+        return colors
+
+    strength = float(np.clip(INTENSITY_COLOR_STRENGTH, 0.0, 1.0))
+    factor = 1.0 + strength * ((norm * 2.0) - 1.0)
+    shaded = colors * factor[:, None]
+    log(
+        "[INFO] Applied scalar_Intensity auxiliary coloring "
+        f"(strength={strength:.2f}, percentiles={INTENSITY_LOW_PERCENTILE:.1f}-{INTENSITY_HIGH_PERCENTILE:.1f})."
+    )
+    return np.clip(shaded, 0.0, 1.0).astype(np.float32, copy=False)
+
+
+def load_direct_ply_rgb_with_intensity(ply_path: Path, expected_points: int) -> Optional[np.ndarray]:
+    layout = read_ply_vertex_attribute_layout(ply_path)
+    if not layout:
+        return None
+
+    fmt = str(layout["format"]).lower().strip()
+    if fmt != "binary_little_endian":
+        log(f"[WARN] Direct PLY RGB/intensity read skipped for unsupported PLY format: {fmt}")
+        return None
+
+    vertex_count = int(layout["vertex_count"])
+    if vertex_count != int(expected_points):
+        log(
+            "[WARN] Direct PLY RGB/intensity read skipped because vertex count "
+            f"({vertex_count}) does not match Open3D point count ({expected_points})."
+        )
+        return None
+
+    vertex_props = list(layout["vertex_props"])
+    prop_names = {name for name, _ in vertex_props}
+    required_rgb = {"red", "green", "blue"}
+    if not required_rgb.issubset(prop_names):
+        missing = ", ".join(sorted(required_rgb - prop_names))
+        log(f"[WARN] Direct RGB fields missing from PLY ({missing}); falling back to Open3D colors.")
+        return None
+
+    dtype = build_ply_vertex_dtype(vertex_props, "<")
+    if dtype is None:
+        return None
+
+    data = np.memmap(ply_path, dtype=dtype, mode="r", offset=int(layout["data_offset"]), shape=(vertex_count,))
+    rgb_raw = np.column_stack([data["red"], data["green"], data["blue"]])
+    colors = normalize_rgb_channels(rgb_raw)
+
+    intensity = None
+    if "scalar_Intensity" in data.dtype.names:
+        intensity = np.asarray(data["scalar_Intensity"], dtype=np.float32)
+    elif "intensity" in data.dtype.names:
+        intensity = np.asarray(data["intensity"], dtype=np.float32)
+
+    colors = apply_intensity_aux_coloring(colors, intensity)
+    log("[INFO] Loaded RGB directly from PLY red/green/blue fields; f_dc_* fields are not used for ordinary point clouds.")
+    return colors
+
+
+def apply_direct_ply_color_attributes(pcd: o3d.geometry.PointCloud, ply_path: Path) -> None:
+    colors = load_direct_ply_rgb_with_intensity(ply_path, int(np.asarray(pcd.points).shape[0]))
+    if colors is None:
+        return
+    pcd.colors = o3d.utility.Vector3dVector(colors.astype(np.float64, copy=False))
+
+
 def random_downsample_pcd(pcd: o3d.geometry.PointCloud, max_points: int) -> o3d.geometry.PointCloud:
     n = np.asarray(pcd.points).shape[0]
     if max_points is None or max_points <= 0 or n <= max_points:
@@ -1575,6 +1773,7 @@ def build_gaussians_once(output_npz_override: Optional[Path] = None,
         raise RuntimeError("Open3D loaded empty point cloud. Check file path/format.")
 
     log(f"[INFO] Loaded {np.asarray(pcd.points).shape[0]} points")
+    apply_direct_ply_color_attributes(pcd, INPUT_PATH)
     stage_times["load_pcd"] = time.perf_counter() - t_stage
 
     t_stage = time.perf_counter()
@@ -1890,6 +2089,8 @@ if __name__ == "__main__":
     ap.add_argument("--sampling_method", default=SAMPLE_MODE, choices=["random", "uniform"], help="Sampling strategy used before Gaussian generation")
     ap.add_argument("--max_points", type=int, default=None, help="Random sampling target point count (-1=all)")
     ap.add_argument("--uniform_resolution", type=float, default=UNIFORM_RESOLUTION, help="Uniform voxel sampling resolution in meters")
+    ap.add_argument("--no_intensity_color", action="store_true", help="Disable scalar_Intensity auxiliary RGB shading")
+    ap.add_argument("--intensity_color_strength", type=float, default=INTENSITY_COLOR_STRENGTH, help="Strength for scalar_Intensity auxiliary RGB shading (0..1)")
     ap.add_argument("--lod_pyramid", action="store_true", help="Build the default sampling-based Gaussian LOD pyramid")
     ap.add_argument("--lod_specs", type=str, default="", help="Comma-separated LOD specs, for example L0=full,L1=10M,L2=1M or L0=1cm,L1=2cm")
 
@@ -1941,6 +2142,8 @@ if __name__ == "__main__":
 
     SAMPLE_MODE = str(args.sampling_method).lower().strip()
     UNIFORM_RESOLUTION = float(args.uniform_resolution)
+    USE_INTENSITY_AUX_COLOR = not bool(args.no_intensity_color)
+    INTENSITY_COLOR_STRENGTH = float(np.clip(args.intensity_color_strength, 0.0, 1.0))
 
     if args.max_points is not None:
         USER_OVERRIDE_MAX_POINTS = True
