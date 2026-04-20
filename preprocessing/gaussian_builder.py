@@ -10,6 +10,29 @@ import subprocess
 import time
 import gc
 
+# Usage examples for sampling-based Gaussian LOD generation:
+#
+# Indoor random LOD pyramid:
+#   python preprocessing/gaussian_builder.py --input data/IndoorOfficeData/IndoorMergedClouds.ply --output data/indoor_random_gaussians.npz --preset final --sampling_method random --lod_pyramid
+#
+# Outdoor random LOD pyramid:
+#   python preprocessing/gaussian_builder.py --input data/TumTLS_v2.ply --output data/outdoor_random_gaussians.npz --preset final --sampling_method random --lod_pyramid
+#
+# Indoor uniform-resolution LOD pyramid:
+#   python preprocessing/gaussian_builder.py --input data/IndoorOfficeData/IndoorMergedClouds.ply --output data/indoor_uniform_gaussians.npz --preset final --sampling_method uniform --lod_pyramid
+#
+# Outdoor uniform-resolution LOD pyramid:
+#   python preprocessing/gaussian_builder.py --input data/TumTLS_v2.ply --output data/outdoor_uniform_gaussians.npz --preset final --sampling_method uniform --lod_pyramid
+#
+# Smaller random test on memory-limited machines:
+#   python preprocessing/gaussian_builder.py --input data/TumTLS_v2.ply --output data/outdoor_random_test_gaussians.npz --preset final --sampling_method random --lod_specs L0=1M,L1=100K,L2=10K --no_autotune
+#
+# Output manifests used by chunking_builder.py:
+#   data/indoor_random_gaussians_final_lod_manifest.json
+#   data/outdoor_random_gaussians_final_lod_manifest.json
+#   data/indoor_uniform_gaussians_final_lod_manifest.json
+#   data/outdoor_uniform_gaussians_final_lod_manifest.json
+
 # Optional (fast CPU KNN)
 try:
     from scipy.spatial import cKDTree  # type: ignore
@@ -48,11 +71,23 @@ def log(msg: str):
         print(msg)
 
 # ==============================
-# Sampling strategy (ONLY random downsample)
+# PLY color attributes
 # ==============================
-SAMPLE_MODE = "random"   # enforced random
+USE_INTENSITY_AUX_COLOR = True
+INTENSITY_COLOR_STRENGTH = 0.25
+INTENSITY_LOW_PERCENTILE = 2.0
+INTENSITY_HIGH_PERCENTILE = 98.0
+INTENSITY_PERCENTILE_SAMPLE = 1_000_000
+
+# ==============================
+# Sampling strategy
+# ==============================
+# Refs: REF-PAPER-3DGS, REF-PAPER-H3DGS, REF-LIB-OPEN3D. See /REFERENCES.md.
+SAMPLE_MODE = "random"   # random | uniform
 MAX_GAUSSIANS = -1
 MAX_GAUSSIANS_AFTER_SAMPLING = MAX_GAUSSIANS
+UNIFORM_RESOLUTION = 0.05
+GAUSSIAN_LOD_LEVELS: Optional[list[dict[str, object]]] = None
 
 # KNN
 K_NEIGHBORS_ISO = 8
@@ -232,7 +267,7 @@ def apply_preset(preset: str):
         raise ValueError(f"Unknown preset: {preset}")
 
     log(f"[INFO] Preset applied: {PRESET}")
-    log(f"[INFO] Sampling mode=random, max_points={MAX_GAUSSIANS}, cap_after={MAX_GAUSSIANS_AFTER_SAMPLING}")
+    log(f"[INFO] Sampling defaults: mode={SAMPLE_MODE}, max_points={MAX_GAUSSIANS}, uniform_resolution={UNIFORM_RESOLUTION:.4f} m")
     log(f"[INFO] dt->st: DT_PERCENTILE={DT_PERCENTILE}, DT_TO_SIGMA_FACTOR={DT_TO_SIGMA_FACTOR:.2f}; "
         f"tangent sigma_factor={TANGENT_WEIGHT_SIGMA_FACTOR:.2f}, w_max={TANGENT_WEIGHT_SIGMA_W_MAX:.2f}")
     log(f"[INFO] S_MAX_POLICY={S_MAX_POLICY}, SIGMA_N_FIXED={SIGMA_N_FIXED:.3f}")
@@ -347,7 +382,7 @@ def estimate_pipeline_bytes_per_point(cache_mode: str,
 
 def estimate_verify_max_points(total_points: int,
                                profile: dict[str, object],
-                               cache_mode: str) -> dict[str, float | int | str]:
+                               cache_mode: str) -> dict[str, object]:
     available_gb = float(profile.get("avail_mem_gb", detect_available_memory_gb()))
     unified_memory = bool(profile.get("unified_memory", False))
     usable_ratio = VERIFY_UNIFIED_AVAILABLE_RAM_FRACTION if unified_memory else VERIFY_AVAILABLE_RAM_FRACTION
@@ -905,12 +940,351 @@ def apply_frame_transform(points: np.ndarray,
     return _cpu_blocked()
 
 
+# Refs: REF-SPEC-PLY. See /REFERENCES.md.
+PLY_NUMPY_TYPES = {
+    "char": "i1",
+    "int8": "i1",
+    "uchar": "u1",
+    "uint8": "u1",
+    "short": "i2",
+    "int16": "i2",
+    "ushort": "u2",
+    "uint16": "u2",
+    "int": "i4",
+    "int32": "i4",
+    "uint": "u4",
+    "uint32": "u4",
+    "float": "f4",
+    "float32": "f4",
+    "double": "f8",
+    "float64": "f8",
+}
+
+
+def read_ply_vertex_attribute_layout(ply_path: Path) -> Optional[dict[str, object]]:
+    """Read the PLY header layout needed for direct RGB/intensity access."""
+    with open(ply_path, "rb") as f:
+        first = f.readline().decode("ascii", errors="replace").strip()
+        if first != "ply":
+            return None
+
+        fmt = ""
+        vertex_count = 0
+        in_vertex = False
+        vertex_props: list[tuple[str, str]] = []
+
+        while True:
+            raw = f.readline()
+            if not raw:
+                return None
+            line = raw.decode("ascii", errors="replace").strip()
+            if line == "end_header":
+                data_offset = f.tell()
+                break
+
+            parts = line.split()
+            if not parts:
+                continue
+
+            if parts[0] == "format" and len(parts) >= 2:
+                fmt = parts[1]
+            elif parts[0] == "element" and len(parts) >= 3:
+                in_vertex = parts[1] == "vertex"
+                if in_vertex:
+                    vertex_count = int(parts[2])
+            elif in_vertex and parts[0] == "property":
+                if len(parts) >= 5 and parts[1] == "list":
+                    log("[WARN] Direct PLY RGB/intensity read skipped because vertex list properties are unsupported.")
+                    return None
+                if len(parts) >= 3:
+                    vertex_props.append((parts[2], parts[1]))
+
+    return {
+        "format": fmt,
+        "vertex_count": vertex_count,
+        "vertex_props": vertex_props,
+        "data_offset": data_offset,
+    }
+
+
+def build_ply_vertex_dtype(vertex_props: list[tuple[str, str]], endian: str) -> Optional[np.dtype]:
+    dtype_fields = []
+    used_names: set[str] = set()
+    for name, ply_type in vertex_props:
+        type_key = ply_type.lower()
+        if type_key not in PLY_NUMPY_TYPES:
+            log(f"[WARN] Direct PLY RGB/intensity read skipped because property type is unsupported: {ply_type}")
+            return None
+        field_name = name
+        if field_name in used_names:
+            suffix = 1
+            while f"{field_name}_{suffix}" in used_names:
+                suffix += 1
+            field_name = f"{field_name}_{suffix}"
+        used_names.add(field_name)
+        dtype_fields.append((field_name, endian + PLY_NUMPY_TYPES[type_key]))
+    return np.dtype(dtype_fields)
+
+
+def normalize_rgb_channels(rgb_raw: np.ndarray) -> np.ndarray:
+    rgb = np.asarray(rgb_raw, dtype=np.float32)
+    if rgb.size == 0:
+        return rgb.reshape((-1, 3))
+    if np.nanmax(rgb) > 1.1:
+        rgb = rgb / 255.0
+    return np.clip(rgb, 0.0, 1.0).astype(np.float32, copy=False)
+
+
+def normalize_intensity_for_color(intensity: np.ndarray) -> Optional[np.ndarray]:
+    values = np.asarray(intensity, dtype=np.float32)
+    finite = values[np.isfinite(values)]
+    if finite.size == 0:
+        return None
+
+    if finite.size > INTENSITY_PERCENTILE_SAMPLE:
+        step = max(1, finite.size // INTENSITY_PERCENTILE_SAMPLE)
+        finite = finite[::step]
+
+    lo = float(np.percentile(finite, INTENSITY_LOW_PERCENTILE))
+    hi = float(np.percentile(finite, INTENSITY_HIGH_PERCENTILE))
+    if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
+        lo = float(np.min(finite))
+        hi = float(np.max(finite))
+    if hi <= lo:
+        return np.full(values.shape, 0.5, dtype=np.float32)
+
+    norm = (values - lo) / (hi - lo)
+    norm = np.nan_to_num(norm, nan=0.5, posinf=1.0, neginf=0.0)
+    return np.clip(norm, 0.0, 1.0).astype(np.float32, copy=False)
+
+
+def apply_intensity_aux_coloring(colors: np.ndarray, intensity: Optional[np.ndarray]) -> np.ndarray:
+    if not USE_INTENSITY_AUX_COLOR or intensity is None or INTENSITY_COLOR_STRENGTH <= 0.0:
+        return colors
+
+    norm = normalize_intensity_for_color(intensity)
+    if norm is None or norm.shape[0] != colors.shape[0]:
+        log("[WARN] scalar_Intensity was found but could not be aligned with RGB colors; using RGB only.")
+        return colors
+
+    strength = float(np.clip(INTENSITY_COLOR_STRENGTH, 0.0, 1.0))
+    factor = 1.0 + strength * ((norm * 2.0) - 1.0)
+    shaded = colors * factor[:, None]
+    log(
+        "[INFO] Applied scalar_Intensity auxiliary coloring "
+        f"(strength={strength:.2f}, percentiles={INTENSITY_LOW_PERCENTILE:.1f}-{INTENSITY_HIGH_PERCENTILE:.1f})."
+    )
+    return np.clip(shaded, 0.0, 1.0).astype(np.float32, copy=False)
+
+
+def load_direct_ply_rgb_with_intensity(ply_path: Path, expected_points: int) -> Optional[np.ndarray]:
+    layout = read_ply_vertex_attribute_layout(ply_path)
+    if not layout:
+        return None
+
+    fmt = str(layout["format"]).lower().strip()
+    if fmt != "binary_little_endian":
+        log(f"[WARN] Direct PLY RGB/intensity read skipped for unsupported PLY format: {fmt}")
+        return None
+
+    vertex_count = int(layout["vertex_count"])
+    if vertex_count != int(expected_points):
+        log(
+            "[WARN] Direct PLY RGB/intensity read skipped because vertex count "
+            f"({vertex_count}) does not match Open3D point count ({expected_points})."
+        )
+        return None
+
+    vertex_props = list(layout["vertex_props"])
+    prop_names = {name for name, _ in vertex_props}
+    required_rgb = {"red", "green", "blue"}
+    if not required_rgb.issubset(prop_names):
+        missing = ", ".join(sorted(required_rgb - prop_names))
+        log(f"[WARN] Direct RGB fields missing from PLY ({missing}); falling back to Open3D colors.")
+        return None
+
+    dtype = build_ply_vertex_dtype(vertex_props, "<")
+    if dtype is None:
+        return None
+
+    data = np.memmap(ply_path, dtype=dtype, mode="r", offset=int(layout["data_offset"]), shape=(vertex_count,))
+    rgb_raw = np.column_stack([data["red"], data["green"], data["blue"]])
+    colors = normalize_rgb_channels(rgb_raw)
+
+    intensity = None
+    if "scalar_Intensity" in data.dtype.names:
+        intensity = np.asarray(data["scalar_Intensity"], dtype=np.float32)
+    elif "intensity" in data.dtype.names:
+        intensity = np.asarray(data["intensity"], dtype=np.float32)
+
+    colors = apply_intensity_aux_coloring(colors, intensity)
+    log("[INFO] Loaded RGB directly from PLY red/green/blue fields; f_dc_* fields are not used for ordinary point clouds.")
+    return colors
+
+
+def apply_direct_ply_color_attributes(pcd: o3d.geometry.PointCloud, ply_path: Path) -> None:
+    colors = load_direct_ply_rgb_with_intensity(ply_path, int(np.asarray(pcd.points).shape[0]))
+    if colors is None:
+        return
+    pcd.colors = o3d.utility.Vector3dVector(colors.astype(np.float64, copy=False))
+
+
 def random_downsample_pcd(pcd: o3d.geometry.PointCloud, max_points: int) -> o3d.geometry.PointCloud:
     n = np.asarray(pcd.points).shape[0]
     if max_points is None or max_points <= 0 or n <= max_points:
         return pcd
     idx = np.random.choice(n, int(max_points), replace=False)
     return pcd.select_by_index(idx)
+
+
+def uniform_downsample_pcd(pcd: o3d.geometry.PointCloud, voxel_size: float) -> o3d.geometry.PointCloud:
+    if voxel_size is None or voxel_size <= 0:
+        return pcd
+    return pcd.voxel_down_sample(float(voxel_size))
+
+
+def apply_sampling_strategy(pcd: o3d.geometry.PointCloud) -> tuple[o3d.geometry.PointCloud, dict[str, object]]:
+    n_full = int(np.asarray(pcd.points).shape[0])
+    mode = (SAMPLE_MODE or "random").lower().strip()
+
+    if mode == "random":
+        target = int(MAX_GAUSSIANS) if MAX_GAUSSIANS is not None else -1
+        pcd_proc = random_downsample_pcd(pcd, target)
+        n_out = int(np.asarray(pcd_proc.points).shape[0])
+        label = "full" if target <= 0 else format_count_label(target)
+        return pcd_proc, {
+            "sampling_method": "random",
+            "sampling_parameter_name": "point_count",
+            "sampling_parameter_value": int(target),
+            "sampling_parameter_label": label,
+            "input_points": n_full,
+            "output_points": n_out,
+        }
+
+    if mode == "uniform":
+        resolution = float(UNIFORM_RESOLUTION)
+        pcd_proc = uniform_downsample_pcd(pcd, resolution)
+        n_out = int(np.asarray(pcd_proc.points).shape[0])
+        return pcd_proc, {
+            "sampling_method": "uniform",
+            "sampling_parameter_name": "resolution_m",
+            "sampling_parameter_value": resolution,
+            "sampling_parameter_label": format_resolution_label(resolution),
+            "input_points": n_full,
+            "output_points": n_out,
+        }
+
+    raise ValueError(f"Unknown sampling mode: {SAMPLE_MODE}")
+
+
+def format_count_label(value: int) -> str:
+    if value <= 0:
+        return "full"
+    if value % 1_000_000 == 0:
+        return f"{value // 1_000_000}M"
+    if value % 1_000 == 0:
+        return f"{value // 1_000}K"
+    return str(value)
+
+
+def format_resolution_label(value_m: float) -> str:
+    cm = value_m * 100.0
+    if abs(cm - round(cm)) < 1e-6:
+        return f"{int(round(cm))}cm"
+    return f"{cm:g}cm"
+
+
+def parse_count_token(token: str) -> int:
+    t = token.strip().lower().replace("_", "")
+    if t in ("full", "all", "-1"):
+        return -1
+    if t.endswith("m"):
+        return int(float(t[:-1]) * 1_000_000)
+    if t.endswith("k"):
+        return int(float(t[:-1]) * 1_000)
+    return int(float(t))
+
+
+def parse_resolution_token(token: str) -> float:
+    t = token.strip().lower().replace("_", "")
+    if t.endswith("cm"):
+        return float(t[:-2]) / 100.0
+    if t.endswith("m"):
+        return float(t[:-1])
+    return float(t)
+
+
+def default_lod_specs(method: str) -> list[dict[str, object]]:
+    m = (method or "random").lower().strip()
+    if m == "random":
+        values = [-1, 10_000_000, 1_000_000, 100_000, 10_000]
+        return [
+            {
+                "level": i,
+                "sampling_method": "random",
+                "sampling_parameter_name": "point_count",
+                "sampling_parameter_value": v,
+                "sampling_parameter_label": format_count_label(v),
+            }
+            for i, v in enumerate(values)
+        ]
+    if m == "uniform":
+        values = [0.01, 0.02, 0.05, 0.10, 0.20]
+        return [
+            {
+                "level": i,
+                "sampling_method": "uniform",
+                "sampling_parameter_name": "resolution_m",
+                "sampling_parameter_value": v,
+                "sampling_parameter_label": format_resolution_label(v),
+            }
+            for i, v in enumerate(values)
+        ]
+    raise ValueError(f"Unknown sampling method for default LOD specs: {method}")
+
+
+def parse_lod_specs(spec: str, method: str) -> list[dict[str, object]]:
+    if not spec:
+        return default_lod_specs(method)
+
+    levels: list[dict[str, object]] = []
+    for i, raw_item in enumerate(spec.split(",")):
+        item = raw_item.strip()
+        if not item:
+            continue
+        if "=" in item:
+            level_token, value_token = item.split("=", 1)
+            level = int(level_token.strip().upper().lstrip("L"))
+        elif ":" in item:
+            level_token, value_token = item.split(":", 1)
+            level = int(level_token.strip().upper().lstrip("L"))
+        else:
+            level = i
+            value_token = item
+
+        m = (method or "random").lower().strip()
+        if m == "random":
+            value = parse_count_token(value_token)
+            label = format_count_label(value)
+            name = "point_count"
+        elif m == "uniform":
+            value = parse_resolution_token(value_token)
+            label = format_resolution_label(value)
+            name = "resolution_m"
+        else:
+            raise ValueError(f"Unknown sampling method: {method}")
+
+        levels.append({
+            "level": level,
+            "sampling_method": m,
+            "sampling_parameter_name": name,
+            "sampling_parameter_value": value,
+            "sampling_parameter_label": label,
+        })
+
+    if not levels:
+        raise ValueError("LOD spec did not contain any levels.")
+    return sorted(levels, key=lambda x: int(x["level"]))
 
 
 def batch_knn_search(points_np: np.ndarray,
@@ -1383,7 +1757,8 @@ def write_chunks_from_arrays(P: np.ndarray,
     log(f"[INFO] Wrote chunk index JSON: {index_path}")
 
 
-def main():
+def build_gaussians_once(output_npz_override: Optional[Path] = None,
+                         lod_metadata: Optional[dict[str, object]] = None) -> dict[str, object]:
     t_start = time.perf_counter()
     stage_times: dict[str, float] = {}
     device_profile: Optional[dict[str, object]] = None
@@ -1398,6 +1773,7 @@ def main():
         raise RuntimeError("Open3D loaded empty point cloud. Check file path/format.")
 
     log(f"[INFO] Loaded {np.asarray(pcd.points).shape[0]} points")
+    apply_direct_ply_color_attributes(pcd, INPUT_PATH)
     stage_times["load_pcd"] = time.perf_counter() - t_stage
 
     t_stage = time.perf_counter()
@@ -1416,17 +1792,17 @@ def main():
     stage_times["pre_shift"] = time.perf_counter() - t_stage
 
     t_stage = time.perf_counter()
-    num_points_full = np.asarray(pcd.points).shape[0]
-    pcd_proc = random_downsample_pcd(pcd, MAX_GAUSSIANS)
-    proc_n = np.asarray(pcd_proc.points).shape[0]
+    pcd_proc, sampling_metadata = apply_sampling_strategy(pcd)
+    if lod_metadata:
+        sampling_metadata.update(lod_metadata)
+    proc_n = int(np.asarray(pcd_proc.points).shape[0])
 
-    cap_n = int(MAX_GAUSSIANS_AFTER_SAMPLING) if MAX_GAUSSIANS_AFTER_SAMPLING is not None else -1
-    if cap_n > 0 and proc_n > cap_n:
-        log(f"[INFO] Random sampling produced {proc_n} points; capping to {cap_n}...")
-        pcd_proc = random_downsample_pcd(pcd_proc, cap_n)
-        proc_n = np.asarray(pcd_proc.points).shape[0]
-
-    log(f"[INFO] Sampling mode=random, full={num_points_full} -> processed={proc_n}")
+    log(
+        "[INFO] Sampling "
+        f"method={sampling_metadata.get('sampling_method')} "
+        f"parameter={sampling_metadata.get('sampling_parameter_label')} "
+        f"input={sampling_metadata.get('input_points')} -> output={proc_n}"
+    )
 
     points = np.asarray(pcd_proc.points).astype(np.float32, copy=False)
     colors = np.asarray(pcd_proc.colors).astype(np.float32, copy=False)
@@ -1561,8 +1937,8 @@ def main():
 
     OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
 
-    out_npz = OUTPUT_PATH
-    if PRESET in ("verify", "final"):
+    out_npz = output_npz_override if output_npz_override is not None else OUTPUT_PATH
+    if output_npz_override is None and PRESET in ("verify", "final"):
         out_npz = OUTPUT_PATH.with_name(f"{OUTPUT_PATH.stem}_{PRESET}{OUTPUT_PATH.suffix}")
 
     np.savez(
@@ -1578,6 +1954,7 @@ def main():
         cov1=cov1,
         colors=colors.astype(np.float32, copy=False),
         opacity=opacity.astype(np.float32, copy=False),
+        sampling_metadata=np.array(json.dumps(sampling_metadata), dtype=np.str_),
     )
     log(f"[INFO] Saved Gaussians to: {out_npz}")
     stage_times["pack_and_save"] = time.perf_counter() - t_stage
@@ -1607,9 +1984,92 @@ def main():
     log(f"[INFO] Total runtime: {elapsed:.2f} s ({elapsed / 60.0:.2f} min)")
     log("[INFO] Done.")
 
+    return {
+        "npz_path": str(out_npz),
+        "preset": PRESET,
+        "sampling": sampling_metadata,
+        "num_points": int(points.shape[0]),
+        "timing": stage_times,
+        "total_sec": float(elapsed),
+    }
+
+
+def run_lod_gaussian_builds(levels: list[dict[str, object]]) -> None:
+    global SAMPLE_MODE, MAX_GAUSSIANS, MAX_GAUSSIANS_AFTER_SAMPLING, UNIFORM_RESOLUTION, USER_OVERRIDE_MAX_POINTS, WRITE_CHUNKS
+
+    manifest_t0 = time.perf_counter()
+    manifest_entries = []
+    base_output = OUTPUT_PATH
+    if WRITE_CHUNKS:
+        log("[WARN] --write_chunks is ignored during Gaussian LOD builds. Run chunking_builder.py with the generated manifest instead.")
+        WRITE_CHUNKS = False
+
+    for level_meta in levels:
+        level = int(level_meta["level"])
+        method = str(level_meta["sampling_method"]).lower().strip()
+        label = str(level_meta["sampling_parameter_label"]).lower().replace(" ", "")
+
+        SAMPLE_MODE = method
+        if method == "random":
+            MAX_GAUSSIANS = int(level_meta["sampling_parameter_value"])
+            MAX_GAUSSIANS_AFTER_SAMPLING = -1
+            USER_OVERRIDE_MAX_POINTS = True
+        elif method == "uniform":
+            UNIFORM_RESOLUTION = float(level_meta["sampling_parameter_value"])
+            MAX_GAUSSIANS_AFTER_SAMPLING = -1
+        else:
+            raise ValueError(f"Unknown sampling method in LOD level: {method}")
+
+        out_npz = base_output.with_name(f"{base_output.stem}_{PRESET}_L{level}_{label}{base_output.suffix}")
+        log(f"[INFO] Building Gaussian L{level} ({method}, {label}) -> {out_npz}")
+        summary = build_gaussians_once(
+            output_npz_override=out_npz,
+            lod_metadata={
+                "lod_level": level,
+                "lod_label": f"L{level}",
+            },
+        )
+        manifest_entries.append({
+            "level": level,
+            "label": f"L{level}",
+            "npz_path": str(out_npz),
+            "sampling_method": method,
+            "sampling_parameter_name": level_meta["sampling_parameter_name"],
+            "sampling_parameter_value": level_meta["sampling_parameter_value"],
+            "sampling_parameter_label": level_meta["sampling_parameter_label"],
+            "num_points": summary["num_points"],
+            "timing": summary["timing"],
+            "total_sec": summary["total_sec"],
+        })
+
+    manifest = {
+        "stage": "gaussian_lod_build",
+        "input_path": str(INPUT_PATH),
+        "output_root": str(base_output.parent),
+        "preset": PRESET,
+        "sampling_method": str(levels[0]["sampling_method"]) if levels else "",
+        "levels": manifest_entries,
+        "total_sec": float(time.perf_counter() - manifest_t0),
+    }
+
+    manifest_path = base_output.with_name(f"{base_output.stem}_{PRESET}_lod_manifest.json")
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(manifest_path, "w", encoding="utf-8") as f:
+        json.dump(manifest, f, indent=2)
+    log(f"[INFO] Wrote Gaussian LOD manifest: {manifest_path}")
+
+
+def main():
+    if GAUSSIAN_LOD_LEVELS:
+        run_lod_gaussian_builds(GAUSSIAN_LOD_LEVELS)
+    else:
+        build_gaussians_once()
+
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
+    ap.add_argument("--input", type=str, default=str(INPUT_PATH), help="Input point cloud path")
+    ap.add_argument("--output", type=str, default=str(OUTPUT_PATH), help="Output Gaussian NPZ path or base path for LOD manifests")
     ap.add_argument("--preset", default=PRESET_DEFAULT, choices=["verify", "final"])
     ap.add_argument("--quiet", action="store_true", help="Disable most logs for speed")
     ap.add_argument("--log_every", type=int, default=LOG_EVERY, help="Progress log interval")
@@ -1626,7 +2086,13 @@ if __name__ == "__main__":
     ap.add_argument("--no_autotune", action="store_true", help="Disable startup micro-benchmark auto-tuning")
     ap.add_argument("--autotune_probe_points", type=int, default=AUTO_TUNE_PROBE_POINTS, help="Probe point count for startup auto-tuning")
 
-    ap.add_argument("--max_points", type=int, default=None, help="Override max points for random downsample (-1=all)")
+    ap.add_argument("--sampling_method", default=SAMPLE_MODE, choices=["random", "uniform"], help="Sampling strategy used before Gaussian generation")
+    ap.add_argument("--max_points", type=int, default=None, help="Random sampling target point count (-1=all)")
+    ap.add_argument("--uniform_resolution", type=float, default=UNIFORM_RESOLUTION, help="Uniform voxel sampling resolution in meters")
+    ap.add_argument("--no_intensity_color", action="store_true", help="Disable scalar_Intensity auxiliary RGB shading")
+    ap.add_argument("--intensity_color_strength", type=float, default=INTENSITY_COLOR_STRENGTH, help="Strength for scalar_Intensity auxiliary RGB shading (0..1)")
+    ap.add_argument("--lod_pyramid", action="store_true", help="Build the default sampling-based Gaussian LOD pyramid")
+    ap.add_argument("--lod_specs", type=str, default="", help="Comma-separated LOD specs, for example L0=full,L1=10M,L2=1M or L0=1cm,L1=2cm")
 
     ap.add_argument("--write_chunks", action="store_true", help="Write chunk txt files + chunks_index.json")
     ap.add_argument("--chunk_dir", type=str, default=str(CHUNK_DIR), help="Chunk output directory")
@@ -1634,6 +2100,9 @@ if __name__ == "__main__":
     ap.add_argument("--chunk_size", type=float, nargs=3, default=CHUNK_SIZE.tolist(), help="Chunk size dx dy dz")
 
     args = ap.parse_args()
+
+    INPUT_PATH = Path(args.input)
+    OUTPUT_PATH = Path(args.output)
 
     if args.quiet:
         VERBOSE = False
@@ -1671,10 +2140,15 @@ if __name__ == "__main__":
 
     apply_preset(args.preset)
 
+    SAMPLE_MODE = str(args.sampling_method).lower().strip()
+    UNIFORM_RESOLUTION = float(args.uniform_resolution)
+    USE_INTENSITY_AUX_COLOR = not bool(args.no_intensity_color)
+    INTENSITY_COLOR_STRENGTH = float(np.clip(args.intensity_color_strength, 0.0, 1.0))
+
     if args.max_points is not None:
         USER_OVERRIDE_MAX_POINTS = True
         MAX_GAUSSIANS = int(args.max_points)
-        MAX_GAUSSIANS_AFTER_SAMPLING = MAX_GAUSSIANS
+        MAX_GAUSSIANS_AFTER_SAMPLING = -1
         log(f"[INFO] Overriding max_points -> {MAX_GAUSSIANS}")
 
     if args.ckdtree_workers is not None:
@@ -1685,5 +2159,9 @@ if __name__ == "__main__":
     CHUNK_DIR = Path(args.chunk_dir)
     CHUNK_PREFIX = str(args.chunk_prefix)
     CHUNK_SIZE = np.array(args.chunk_size, dtype=np.float32)
+
+    if args.lod_pyramid or args.lod_specs:
+        GAUSSIAN_LOD_LEVELS = parse_lod_specs(str(args.lod_specs), SAMPLE_MODE)
+        log(f"[INFO] Gaussian LOD build enabled with {len(GAUSSIAN_LOD_LEVELS)} levels.")
 
     main()

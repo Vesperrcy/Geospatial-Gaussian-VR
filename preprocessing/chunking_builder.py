@@ -5,191 +5,315 @@ from pathlib import Path
 
 import numpy as np
 
-# ====== Config ======
-NPZ_PATH = Path("data/Indoordata_demo_final.npz")
-CHUNK_DIR = Path("data/chunks_Indoordata")
+# Usage examples for converting Gaussian LOD manifests into chunk LOD files:
+#
+# Indoor random chunks:
+#   python preprocessing/chunking_builder.py --lod_manifest data/indoor_random_gaussians_final_lod_manifest.json --chunk_dir data/chunks_indoor_random
+#
+# Outdoor random chunks:
+#   python preprocessing/chunking_builder.py --lod_manifest data/outdoor_random_gaussians_final_lod_manifest.json --chunk_dir data/chunks_outdoor_random
+#
+# Indoor uniform-resolution chunks:
+#   python preprocessing/chunking_builder.py --lod_manifest data/indoor_uniform_gaussians_final_lod_manifest.json --chunk_dir data/chunks_indoor_uniform
+#
+# Outdoor uniform-resolution chunks:
+#   python preprocessing/chunking_builder.py --lod_manifest data/outdoor_uniform_gaussians_final_lod_manifest.json --chunk_dir data/chunks_outdoor_uniform
+#
+#
+# After this step, run lod_builder.py on the same chunk directory.
+
+
+
+NPZ_PATH = Path("data/TumTLS_v2_gaussians_demo_final.npz")
+LOD_MANIFEST_PATH = Path("")
+CHUNK_DIR = Path("data/chunks_TUMv2")
 CHUNK_PREFIX = "chunk"
-CHUNK_SIZE = np.array([10.0, 10.0, 10.0], dtype=np.float32)  # dx, dy, dz
+CHUNK_SIZE = np.array([10.0, 10.0, 10.0], dtype=np.float32)
 EPS = 1e-5
 
 
-def _log(msg: str):
-    print(msg)
+def log_elapsed(step_name: str, t0: float) -> float:
+    elapsed = time.perf_counter() - t0
+    print(f"[TIME] {step_name}: {elapsed:.2f}s")
+    return elapsed
 
 
-def _load_cov6(data) -> np.ndarray:
-    if "cov6" in data:
-        return data["cov6"].astype(np.float32, copy=False)
-
-    if "cov0" in data and "cov1" in data:
-        cov0 = data["cov0"].astype(np.float32, copy=False)  # (N,4): xx,xy,xz,yy
-        cov1 = data["cov1"].astype(np.float32, copy=False)  # (N,4): yz,zz,0,0
-        cov6 = np.empty((cov0.shape[0], 6), dtype=np.float32)
-        cov6[:, 0] = cov0[:, 0]
-        cov6[:, 1] = cov0[:, 1]
-        cov6[:, 2] = cov0[:, 2]
-        cov6[:, 3] = cov0[:, 3]
-        cov6[:, 4] = cov1[:, 0]
-        cov6[:, 5] = cov1[:, 1]
-        return cov6
-
-    raise KeyError("NPZ must contain 'cov6' or both 'cov0' and 'cov1'.")
-
-
-def _chunk_ids_from_ijk(ijk: np.ndarray, ny: int, nz: int) -> np.ndarray:
-    # Monotonic mapping preserving lexicographic (ix, iy, iz) order after sort.
-    return (ijk[:, 0].astype(np.int64) * int(ny) + ijk[:, 1].astype(np.int64)) * int(nz) + ijk[:, 2].astype(np.int64)
-
-
-def _decode_chunk_id(chunk_id: int, ny: int, nz: int) -> tuple[int, int, int]:
-    ix = int(chunk_id // (ny * nz))
-    rem = int(chunk_id % (ny * nz))
-    iy = int(rem // nz)
-    iz = int(rem % nz)
-    return ix, iy, iz
-
-
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--npz", type=str, default=str(NPZ_PATH), help="Input NPZ path")
-    parser.add_argument("--chunk_dir", type=str, default=str(CHUNK_DIR), help="Output chunk directory")
-    parser.add_argument("--chunk_prefix", type=str, default=CHUNK_PREFIX, help="Chunk filename prefix")
-    parser.add_argument("--chunk_size", type=float, nargs=3, default=CHUNK_SIZE.tolist(), help="Chunk size dx dy dz")
-    args = parser.parse_args()
-
-    npz_path = Path(args.npz)
-    out_dir = Path(args.chunk_dir)
-    chunk_prefix = str(args.chunk_prefix)
-    chunk_size = np.asarray(args.chunk_size, dtype=np.float32)
-
-    stage_times: dict[str, float] = {}
-    t_start = time.perf_counter()
-
-    t_stage = time.perf_counter()
-    _log(f"[B] Loading NPZ: {npz_path}")
+def load_gaussian_npz(npz_path: Path) -> dict[str, np.ndarray]:
     if not npz_path.exists():
         raise FileNotFoundError(f"NPZ file not found: {npz_path}")
 
     data = np.load(npz_path)
-    P = data["positions"].astype(np.float32, copy=False)  # (N,3)
-    C = data["colors"].astype(np.float32, copy=False)     # (N,3)
-    cov6 = _load_cov6(data)
+    positions = data["positions"].astype(np.float32)
+    colors = data["colors"].astype(np.float32) if "colors" in data else np.empty((positions.shape[0], 0), dtype=np.float32)
 
-    N = int(P.shape[0])
-    _log(f"[B1] Loaded {N} Gaussians")
-    stage_times["load_npz"] = time.perf_counter() - t_stage
+    if "cov6" in data:
+        cov6 = data["cov6"].astype(np.float32)
+    elif "cov0" in data and "cov1" in data:
+        cov0 = data["cov0"].astype(np.float32)
+        cov1 = data["cov1"].astype(np.float32)
+        cov6 = np.stack(
+            [cov0[:, 0], cov0[:, 1], cov0[:, 2], cov0[:, 3], cov1[:, 0], cov1[:, 1]],
+            axis=1,
+        ).astype(np.float32)
+    else:
+        raise KeyError("NPZ must contain 'cov6' or both 'cov0' and 'cov1' for anisotropic splatting.")
 
-    t_stage = time.perf_counter()
-    xyz_min = P.min(axis=0)
-    xyz_max = P.max(axis=0)
-
-    _log("[B1] XYZ range:")
-    _log(f"  X[{xyz_min[0]:.2f}, {xyz_max[0]:.2f}]")
-    _log(f"  Y[{xyz_min[1]:.2f}, {xyz_max[1]:.2f}]")
-    _log(f"  Z[{xyz_min[2]:.2f}, {xyz_max[2]:.2f}]")
-
-    origin = xyz_min.copy()
-    extent = xyz_max - xyz_min
-    grid = np.ceil((extent + EPS) / chunk_size).astype(np.int64)
-    nx, ny, nz = [int(v) for v in grid.tolist()]
-    _log(f"[B1] Chunk grid (nx,ny,nz) = {nx} {ny} {nz}")
-    stage_times["bbox_and_grid"] = time.perf_counter() - t_stage
-
-    t_stage = time.perf_counter()
-    rel = P - origin.reshape(1, 3)
-    ijk = np.floor(rel / chunk_size.reshape(1, 3)).astype(np.int64)
-
-    ijk[:, 0] = np.clip(ijk[:, 0], 0, nx - 1)
-    ijk[:, 1] = np.clip(ijk[:, 1], 0, ny - 1)
-    ijk[:, 2] = np.clip(ijk[:, 2], 0, nz - 1)
-
-    chunk_ids = _chunk_ids_from_ijk(ijk, ny, nz)
-    order = np.argsort(chunk_ids, kind="mergesort")
-    sorted_ids = chunk_ids[order]
-
-    unique_ids, start_idx, counts = np.unique(sorted_ids, return_index=True, return_counts=True)
-
-    non_empty_chunks = int(unique_ids.shape[0])
-    _log(f"[B2] Number of non-empty chunks: {non_empty_chunks}")
-
-    preview_n = min(10, non_empty_chunks)
-    for i in range(preview_n):
-        ix, iy, iz = _decode_chunk_id(int(unique_ids[i]), ny, nz)
-        _log(f"  chunk ({ix}, {iy}, {iz}) has {int(counts[i])} points")
-
-    total_pts = int(counts.sum())
-    _log(f"[B2] Total points over all chunks = {total_pts}")
-    stage_times["build_chunk_groups"] = time.perf_counter() - t_stage
-
-    t_stage = time.perf_counter()
-    out_dir.mkdir(parents=True, exist_ok=True)
-    chunk_meta: list[dict] = []
-
-    _log(f"[B3] Writing chunk files to: {out_dir}")
-    for i in range(non_empty_chunks):
-        cid = int(unique_ids[i])
-        s0 = int(start_idx[i])
-        s1 = s0 + int(counts[i])
-
-        idx_arr = order[s0:s1]
-
-        P_chunk = P[idx_arr]
-        C_chunk = C[idx_arr]
-        cov6_chunk = cov6[idx_arr]
-
-        mat = np.empty((P_chunk.shape[0], 12), dtype=np.float32)
-        mat[:, 0:3] = P_chunk
-        mat[:, 3:6] = C_chunk
-        mat[:, 6:12] = cov6_chunk
-
-        ix, iy, iz = _decode_chunk_id(cid, ny, nz)
-        fname = f"{chunk_prefix}_{ix}_{iy}_{iz}.txt"
-        fpath = out_dir / fname
-        np.savetxt(fpath, mat, fmt="%.6f")
-
-        bbox_min = P_chunk.min(axis=0)
-        bbox_max = P_chunk.max(axis=0)
-        center = 0.5 * (bbox_min + bbox_max)
-
-        chunk_meta.append({
-            "ijk": [ix, iy, iz],
-            "filename": fname,
-            "count": int(P_chunk.shape[0]),
-            "bbox_min": bbox_min.tolist(),
-            "bbox_max": bbox_max.tolist(),
-            "center": center.tolist(),
-        })
-
-    _log(f"[B3] Wrote {len(chunk_meta)} chunk files.")
-    stage_times["write_chunks"] = time.perf_counter() - t_stage
-
-    t_stage = time.perf_counter()
-    index = {
-        "npz_source": str(npz_path),
-        "origin": origin.tolist(),
-        "chunk_size": chunk_size.tolist(),
-        "grid_shape": [nx, ny, nz],
-        "num_points": N,
-        "num_chunks": len(chunk_meta),
-        "chunks": chunk_meta,
+    return {
+        "positions": positions,
+        "colors": colors,
+        "cov6": cov6,
     }
 
-    index_path = out_dir / "chunks_index.json"
+
+def load_lod_levels(manifest_path: Path, fallback_npz_path: Path) -> tuple[list[dict[str, object]], dict[str, object]]:
+    if manifest_path and str(manifest_path) and manifest_path.exists():
+        with open(manifest_path, "r", encoding="utf-8") as f:
+            manifest = json.load(f)
+        levels = []
+        for raw in manifest.get("levels", []):
+            level = int(raw["level"])
+            levels.append({
+                "level": level,
+                "label": raw.get("label", f"L{level}"),
+                "npz_path": str(raw["npz_path"]),
+                "sampling_method": raw.get("sampling_method", manifest.get("sampling_method", "")),
+                "sampling_parameter_name": raw.get("sampling_parameter_name", ""),
+                "sampling_parameter_value": raw.get("sampling_parameter_value", ""),
+                "sampling_parameter_label": raw.get("sampling_parameter_label", ""),
+                "gaussian_points": raw.get("num_points", 0),
+                "gaussian_timing": raw.get("timing", {}),
+                "gaussian_total_sec": raw.get("total_sec", 0.0),
+            })
+        if not levels:
+            raise ValueError(f"LOD manifest has no levels: {manifest_path}")
+        return sorted(levels, key=lambda x: int(x["level"])), manifest
+
+    return [
+        {
+            "level": 0,
+            "label": "L0",
+            "npz_path": str(fallback_npz_path),
+            "sampling_method": "",
+            "sampling_parameter_name": "",
+            "sampling_parameter_value": "",
+            "sampling_parameter_label": "single",
+            "gaussian_points": 0,
+            "gaussian_timing": {},
+            "gaussian_total_sec": 0.0,
+        }
+    ], {}
+
+
+def compute_global_grid(levels: list[dict[str, object]]) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    mins = []
+    maxs = []
+    for level in levels:
+        arrays = load_gaussian_npz(Path(str(level["npz_path"])))
+        points = arrays["positions"]
+        mins.append(points.min(axis=0))
+        maxs.append(points.max(axis=0))
+
+    xyz_min = np.min(np.vstack(mins), axis=0)
+    xyz_max = np.max(np.vstack(maxs), axis=0)
+    extent = xyz_max - xyz_min
+    grid = np.ceil((extent + EPS) / CHUNK_SIZE).astype(int)
+    grid = np.maximum(grid, 1)
+    return xyz_min.astype(np.float32), xyz_max.astype(np.float32), grid.astype(np.int32)
+
+
+def assign_chunk_indices(points: np.ndarray, origin: np.ndarray, grid: np.ndarray) -> dict[tuple[int, int, int], np.ndarray]:
+    rel = points - origin[None, :]
+    ijk = np.floor(rel / CHUNK_SIZE[None, :]).astype(np.int32)
+    ijk[:, 0] = np.clip(ijk[:, 0], 0, int(grid[0]) - 1)
+    ijk[:, 1] = np.clip(ijk[:, 1], 0, int(grid[1]) - 1)
+    ijk[:, 2] = np.clip(ijk[:, 2], 0, int(grid[2]) - 1)
+
+    linear = ijk[:, 0] + ijk[:, 1] * int(grid[0]) + ijk[:, 2] * int(grid[0]) * int(grid[1])
+    order = np.argsort(linear, kind="stable")
+    sorted_linear = linear[order]
+    unique, starts = np.unique(sorted_linear, return_index=True)
+
+    chunks: dict[tuple[int, int, int], np.ndarray] = {}
+    for pos, key_linear in enumerate(unique):
+        start = starts[pos]
+        end = starts[pos + 1] if pos + 1 < len(starts) else len(order)
+        idx = order[start:end]
+        iz = int(key_linear // (int(grid[0]) * int(grid[1])))
+        rem = int(key_linear - iz * int(grid[0]) * int(grid[1]))
+        iy = int(rem // int(grid[0]))
+        ix = int(rem - iy * int(grid[0]))
+        chunks[(ix, iy, iz)] = idx
+    return chunks
+
+
+def write_level_chunks(level: dict[str, object],
+                       origin: np.ndarray,
+                       grid: np.ndarray,
+                       chunk_registry: dict[tuple[int, int, int], dict[str, object]]) -> dict[str, object]:
+    arrays = load_gaussian_npz(Path(str(level["npz_path"])))
+    points = arrays["positions"]
+    colors = arrays["colors"]
+    cov6 = arrays["cov6"]
+    if colors.size == 0:
+        colors = np.tile(np.array([[0.7, 0.7, 0.7]], dtype=np.float32), (points.shape[0], 1))
+
+    level_num = int(level["level"])
+    chunks = assign_chunk_indices(points, origin, grid)
+    total_written = 0
+
+    for (ix, iy, iz), idx in chunks.items():
+        p_chunk = points[idx]
+        c_chunk = colors[idx]
+        cov6_chunk = cov6[idx]
+        mat = np.hstack([p_chunk, c_chunk, cov6_chunk])
+        fname = f"{CHUNK_PREFIX}_{ix}_{iy}_{iz}_L{level_num}.txt"
+        np.savetxt(CHUNK_DIR / fname, mat, fmt="%.6f")
+
+        bbox_min = p_chunk.min(axis=0)
+        bbox_max = p_chunk.max(axis=0)
+        center = 0.5 * (bbox_min + bbox_max)
+
+        meta = chunk_registry.setdefault(
+            (ix, iy, iz),
+            {
+                "ijk": [int(ix), int(iy), int(iz)],
+                "bbox_min": bbox_min.tolist(),
+                "bbox_max": bbox_max.tolist(),
+                "center": center.tolist(),
+                "lod": {},
+            },
+        )
+
+        old_min = np.asarray(meta["bbox_min"], dtype=np.float32)
+        old_max = np.asarray(meta["bbox_max"], dtype=np.float32)
+        new_min = np.minimum(old_min, bbox_min)
+        new_max = np.maximum(old_max, bbox_max)
+        meta["bbox_min"] = new_min.tolist()
+        meta["bbox_max"] = new_max.tolist()
+        meta["center"] = (0.5 * (new_min + new_max)).tolist()
+        meta["lod"][f"L{level_num}"] = {
+            "filename": fname,
+            "count": int(p_chunk.shape[0]),
+            "sampling_method": level.get("sampling_method", ""),
+            "sampling_parameter_name": level.get("sampling_parameter_name", ""),
+            "sampling_parameter_value": level.get("sampling_parameter_value", ""),
+            "sampling_parameter_label": level.get("sampling_parameter_label", ""),
+        }
+        total_written += int(p_chunk.shape[0])
+
+    return {
+        "level": level_num,
+        "num_points": int(points.shape[0]),
+        "num_chunks": int(len(chunks)),
+        "written_points": int(total_written),
+    }
+
+
+def build_chunk_index(levels: list[dict[str, object]],
+                      manifest: dict[str, object],
+                      origin: np.ndarray,
+                      xyz_max: np.ndarray,
+                      grid: np.ndarray,
+                      chunk_registry: dict[tuple[int, int, int], dict[str, object]],
+                      timing: dict[str, float]) -> dict[str, object]:
+    lod_levels = [int(level["level"]) for level in levels]
+    chunks = []
+    for key in sorted(chunk_registry.keys()):
+        meta = chunk_registry[key]
+        lod_files = []
+        lod_counts = []
+        for level in lod_levels:
+            lod_meta = meta["lod"].get(f"L{level}", {})
+            lod_files.append(str(lod_meta.get("filename", "")))
+            lod_counts.append(int(lod_meta.get("count", 0)))
+        first_file = next((name for name in lod_files if name), "")
+        first_count = next((count for count in lod_counts if count > 0), 0)
+        meta_out = dict(meta)
+        meta_out["filename"] = first_file
+        meta_out["count"] = int(first_count)
+        meta_out["lod_files"] = lod_files
+        meta_out["lod_counts"] = lod_counts
+        chunks.append(meta_out)
+
+    return {
+        "stage": "chunking",
+        "gaussian_lod_manifest": manifest,
+        "lod_levels": lod_levels,
+        "lod_descriptors": levels,
+        "origin": origin.tolist(),
+        "chunk_size": CHUNK_SIZE.tolist(),
+        "grid_shape": [int(grid[0]), int(grid[1]), int(grid[2])],
+        "xyz_max": xyz_max.tolist(),
+        "num_points": int(sum(int(level.get("gaussian_points") or 0) for level in levels)),
+        "num_chunks": len(chunks),
+        "timing": timing,
+        "chunks": chunks,
+    }
+
+
+def main() -> None:
+    total_t0 = time.perf_counter()
+    timing: dict[str, float] = {}
+
+    print("[INFO] Stage B: Building sampling-based LOD chunks")
+    levels, manifest = load_lod_levels(LOD_MANIFEST_PATH, NPZ_PATH)
+    print(f"[INFO] Loaded {len(levels)} LOD level input(s).")
+
+    t0 = time.perf_counter()
+    origin, xyz_max, grid = compute_global_grid(levels)
+    timing["compute_global_grid_sec"] = log_elapsed("Compute global chunk grid", t0)
+    print(f"[INFO] Global grid shape: {int(grid[0])} {int(grid[1])} {int(grid[2])}")
+
+    CHUNK_DIR.mkdir(parents=True, exist_ok=True)
+    chunk_registry: dict[tuple[int, int, int], dict[str, object]] = {}
+    level_summaries = []
+
+    for level in levels:
+        level_t0 = time.perf_counter()
+        print(
+            "[INFO] Writing chunks for "
+            f"L{int(level['level'])} ({level.get('sampling_method', '')}, "
+            f"{level.get('sampling_parameter_label', '')})"
+        )
+        summary = write_level_chunks(level, origin, grid, chunk_registry)
+        summary["chunking_sec"] = log_elapsed(f"Write chunks for L{int(level['level'])}", level_t0)
+        level_summaries.append(summary)
+
+    timing["total_chunk_file_write_sec"] = float(sum(float(s["chunking_sec"]) for s in level_summaries))
+
+    timing["total_sec"] = float(time.perf_counter() - total_t0)
+    index = build_chunk_index(levels, manifest, origin, xyz_max, grid, chunk_registry, timing)
+    index["level_summaries"] = level_summaries
+
+    t0 = time.perf_counter()
+    index_path = CHUNK_DIR / "chunks_index.json"
+    with open(index_path, "w", encoding="utf-8") as f:
+        json.dump(index, f, indent=2)
+    timing["write_index_sec"] = log_elapsed("Write chunk index JSON", t0)
+    timing["total_sec"] = float(time.perf_counter() - total_t0)
+    index["timing"] = timing
     with open(index_path, "w", encoding="utf-8") as f:
         json.dump(index, f, indent=2)
 
-    _log(f"[B4] Wrote chunk index JSON to: {index_path}")
-    stage_times["write_index_json"] = time.perf_counter() - t_stage
-
-    elapsed = time.perf_counter() - t_start
-    _log("[B] Stage runtime breakdown:")
-    for key in ["load_npz", "bbox_and_grid", "build_chunk_groups", "write_chunks", "write_index_json"]:
-        v = stage_times.get(key, 0.0)
-        _log(f"  - {key}: {v:.2f} s ({(100.0 * v / max(elapsed, 1e-9)):.1f}%)")
-
-    _log(f"[B] Total runtime: {elapsed:.2f} s ({elapsed / 60.0:.2f} min)")
-    _log("[B4] Done.")
+    print(f"[INFO] Wrote chunk index JSON to: {index_path}")
+    print(f"[INFO] Non-empty chunks across all levels: {len(chunk_registry)}")
+    print(f"[TIME] Total: {time.perf_counter() - total_t0:.2f}s")
+    print("[INFO] Stage B done.")
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--npz", type=str, default=str(NPZ_PATH), help="Fallback single Gaussian NPZ input")
+    parser.add_argument("--lod_manifest", type=str, default="", help="Gaussian LOD manifest from gaussian_builder.py")
+    parser.add_argument("--chunk_dir", type=str, default=str(CHUNK_DIR), help="Chunk output directory")
+    parser.add_argument("--chunk_prefix", type=str, default=CHUNK_PREFIX, help="Chunk filename prefix")
+    parser.add_argument("--chunk_size", type=float, nargs=3, default=CHUNK_SIZE.tolist(), help="Chunk size dx dy dz")
+    args = parser.parse_args()
+
+    NPZ_PATH = Path(args.npz)
+    LOD_MANIFEST_PATH = Path(args.lod_manifest) if args.lod_manifest else Path("")
+    CHUNK_DIR = Path(args.chunk_dir)
+    CHUNK_PREFIX = str(args.chunk_prefix)
+    CHUNK_SIZE = np.array(args.chunk_size, dtype=np.float32)
+
     main()
